@@ -7,6 +7,7 @@ and can be adapted to use HA test fixtures later.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -1585,6 +1586,12 @@ class TestSetupAndUnload:
         assert isinstance(hass.data[DOMAIN][entry.entry_id], PvExcessCoordinator)
         mock_refresh.assert_awaited_once()
         mock_forward.assert_awaited_once_with(entry, PLATFORMS)
+
+        # Run the unload callbacks as HA would, so the midnight timer does not linger.
+        for call in entry.async_on_unload.call_args_list:
+            result = call.args[0]()
+            if inspect.isawaitable(result):
+                await result
 
     @pytest.mark.asyncio
     async def test_async_unload_entry_removes_data(self):
