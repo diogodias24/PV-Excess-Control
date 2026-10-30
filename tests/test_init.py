@@ -213,6 +213,9 @@ def _make_coordinator(
     coord.appliance_enabled = {}
     coord.appliance_overrides = {}
     coord.appliance_priorities = {}
+    coord.appliance_battery_assist = {}
+    coord.appliance_battery_assist_max_share = {}
+    coord.appliance_battery_assist_min_soc = {}
     coord.appliance_min_daily_runtime = {}
     coord.appliance_max_daily_runtime = {}
     coord.battery_strategy = entry.data.get(

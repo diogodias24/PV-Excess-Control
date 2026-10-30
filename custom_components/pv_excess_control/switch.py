@@ -11,7 +11,14 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_APPLIANCE_NAME, CONF_BATTERY_GRID_CHARGE_POWER_W, DOMAIN, MANUFACTURER
+from .const import (
+    CONF_APPLIANCE_NAME,
+    CONF_BATTERY_ASSIST_APPLIANCES,
+    CONF_BATTERY_GRID_CHARGE_POWER_W,
+    CONF_DYNAMIC_CURRENT,
+    DOMAIN,
+    MANUFACTURER,
+)
 from .coordinator import PvExcessCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +43,8 @@ async def async_setup_entry(
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
         entities.append(ApplianceEnabledSwitch(coordinator, subentry_id, appliance_name))
         entities.append(ApplianceOverrideSwitch(coordinator, subentry_id, appliance_name))
+        if subentry.data.get(CONF_DYNAMIC_CURRENT, False):
+            entities.append(BatteryAssistSwitch(coordinator, subentry_id, appliance_name))
 
     async_add_entities(entities)
 
@@ -229,4 +238,45 @@ class ApplianceOverrideSwitch(_PvExcessSwitchBase):
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.appliance_overrides[self._appliance_id] = False
         self._persist_overridden_list()
+        self.async_write_ha_state()
+
+
+class BatteryAssistSwitch(_PvExcessSwitchBase):
+    """Per-appliance Battery Assist switch (solar-led battery top-up). Default off."""
+
+    _attr_icon = "mdi:battery-heart-variant"
+
+    def __init__(
+        self,
+        coordinator: PvExcessCoordinator,
+        appliance_id: str,
+        appliance_name: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._appliance_id = appliance_id
+        self._appliance_name = appliance_name
+        self._attr_name = f"{appliance_name} Battery Assist"
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{appliance_id}_battery_assist"
+        )
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.appliance_battery_assist.get(self._appliance_id, False)
+
+    def _persist_assist_list(self) -> None:
+        """Persist the list of Battery Assist appliance IDs to config_entry.data."""
+        active = [
+            aid for aid, on in self.coordinator.appliance_battery_assist.items() if on
+        ]
+        self._persist(CONF_BATTERY_ASSIST_APPLIANCES, active)
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.appliance_battery_assist[self._appliance_id] = True
+        self._persist_assist_list()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.appliance_battery_assist[self._appliance_id] = False
+        self._persist_assist_list()
         self.async_write_ha_state()

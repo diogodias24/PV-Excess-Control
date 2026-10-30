@@ -23,6 +23,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONF_BATTERY_ASSIST_APPLIANCES,
+    CONF_BATTERY_ASSIST_MAX_SHARE,
+    CONF_BATTERY_ASSIST_MIN_SOC,
+    DEFAULT_BATTERY_ASSIST_MAX_SHARE,
+    DEFAULT_BATTERY_ASSIST_MIN_SOC,
+    MAX_BATTERY_ASSIST_SHARE,
     CONF_ALLOW_GRID_CHARGING,
     CONF_APPLIANCE_ENTITY,
     CONF_AVERAGING_WINDOW,
@@ -360,6 +366,11 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.appliance_overrides: dict[str, bool] = {
             aid: True for aid in overridden_ids
         }
+        self.appliance_battery_assist: dict[str, bool] = {
+            aid: True for aid in config_entry.data.get(CONF_BATTERY_ASSIST_APPLIANCES, [])
+        }
+        self.appliance_battery_assist_max_share: dict[str, float] = {}
+        self.appliance_battery_assist_min_soc: dict[str, float] = {}
         self.appliance_priorities: dict[str, int] = {}
         self.appliance_min_daily_runtime: dict[str, int | None] = {}
         self.appliance_max_daily_runtime: dict[str, int | None] = {}
@@ -382,6 +393,12 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Clamp to minimum of 5s to protect against legacy configs that may have stored 0
             self.appliance_switch_intervals[subentry_id] = int(max(5, saved_interval))
             self.appliance_restart_intervals[subentry_id] = d.get(CONF_RESTART_INTERVAL)
+            self.appliance_battery_assist_max_share[subentry_id] = float(
+                d.get(CONF_BATTERY_ASSIST_MAX_SHARE, DEFAULT_BATTERY_ASSIST_MAX_SHARE)
+            )
+            self.appliance_battery_assist_min_soc[subentry_id] = float(
+                d.get(CONF_BATTERY_ASSIST_MIN_SOC, DEFAULT_BATTERY_ASSIST_MIN_SOC)
+            )
 
         # Track last-set battery discharge limit to avoid redundant calls.
         # Seed from actual entity value on startup to avoid unnecessary service calls.
@@ -1163,6 +1180,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 switch_interval=switch_interval,
                 restart_interval=sub_data.get(CONF_RESTART_INTERVAL),
                 allow_grid_supplement=sub_data.get(CONF_ALLOW_GRID_SUPPLEMENT, False),
+                **self._battery_assist_fields(subentry_id),
                 max_grid_power=sub_data.get(CONF_MAX_GRID_POWER),
                 cheap_grid_target_current=sub_data.get(CONF_CHEAP_GRID_TARGET_CURRENT),
                 cheap_price_threshold=sub_data.get(CONF_CHEAP_PRICE_THRESHOLD),
@@ -1214,6 +1232,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._previous_is_on,
             self.appliance_enabled,
             self.appliance_overrides,
+            self.appliance_battery_assist,
+            self.appliance_battery_assist_max_share,
+            self.appliance_battery_assist_min_soc,
             self.appliance_priorities,
             self.appliance_min_daily_runtime,
             self.appliance_max_daily_runtime,
@@ -2003,6 +2024,19 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _battery_assist_fields(self, appliance_id: str) -> dict:
+        """Runtime Battery Assist settings as ApplianceConfig kwargs (share clamped 0-90)."""
+        max_share = self.appliance_battery_assist_max_share.get(
+            appliance_id, DEFAULT_BATTERY_ASSIST_MAX_SHARE
+        )
+        return {
+            "battery_assist_enabled": self.appliance_battery_assist.get(appliance_id, False),
+            "battery_assist_max_share": max(0.0, min(float(max_share), MAX_BATTERY_ASSIST_SHARE)),
+            "battery_assist_min_soc": float(self.appliance_battery_assist_min_soc.get(
+                appliance_id, DEFAULT_BATTERY_ASSIST_MIN_SOC
+            )),
+        }
+
     def _get_appliance_config_by_id(
         self, appliance_id: str
     ) -> ApplianceConfig | None:
@@ -2064,6 +2098,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )),
             restart_interval=sub_data.get(CONF_RESTART_INTERVAL),
             allow_grid_supplement=sub_data.get(CONF_ALLOW_GRID_SUPPLEMENT, False),
+            **self._battery_assist_fields(appliance_id),
             max_grid_power=sub_data.get(CONF_MAX_GRID_POWER),
             cheap_grid_target_current=sub_data.get(CONF_CHEAP_GRID_TARGET_CURRENT),
             cheap_price_threshold=sub_data.get(CONF_CHEAP_PRICE_THRESHOLD),

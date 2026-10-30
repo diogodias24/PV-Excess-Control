@@ -130,6 +130,13 @@ class ApplianceConfig:
     dynamic_current_min_delta: float = 0.0  # min amp change before a write (0 = off)
     dynamic_current_decrease_bypass: bool = True  # current reductions bypass the throttle
 
+    # Battery Assist (solar-led), runtime-controlled via switch + numbers.
+    # When enabled, max share > 0 and battery SoC >= min SoC, the allowed draw
+    # is solar_available / (1 - max_share/100): the battery covers the gap.
+    battery_assist_enabled: bool = False
+    battery_assist_max_share: float = 30.0  # percent, 0-90
+    battery_assist_min_soc: float = 61.0  # percent
+
 
 @dataclass
 class ApplianceState:

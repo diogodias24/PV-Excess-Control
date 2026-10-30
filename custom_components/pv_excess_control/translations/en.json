@@ -565,6 +565,17 @@
       },
       "max_daily_runtime": {
         "name": "Max Daily Runtime"
+      },
+      "battery_assist_max_share": {
+        "name": "Battery Assist Max Share"
+      },
+      "battery_assist_min_soc": {
+        "name": "Battery Assist Min SoC"
+      }
+    },
+    "switch": {
+      "battery_assist": {
+        "name": "Battery Assist"
       }
     }
   }

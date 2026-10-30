@@ -16,11 +16,13 @@ from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from custom_components.pv_excess_control.const import (
+    BATTERY_ASSIST_SOC_HYSTERESIS,
     DEFAULT_DYNAMIC_ON_THRESHOLD,
     DEFAULT_GRID_VOLTAGE,
     DEFAULT_NOT_DRAWING_THRESHOLD_W,
     DEFAULT_OFF_THRESHOLD,
     DEFAULT_ON_THRESHOLD,
+    MAX_BATTERY_ASSIST_SHARE,
     NOT_DRAWING_GRACE_SECONDS,
     SHED_COOLDOWN_BYPASS_IMPORT_W,
 )
@@ -35,7 +37,12 @@ from custom_components.pv_excess_control.models import (
     PowerState,
     TariffInfo,
 )
-from custom_components.pv_excess_control.status_formatter import format_duration
+from custom_components.pv_excess_control.status_formatter import (
+    format_battery_assist_active,
+    format_battery_assist_paused,
+    format_battery_assist_waiting,
+    format_duration,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +85,11 @@ class Optimizer:
         # Initialised here for safety; optimize() overwrites both on every cycle.
         self._plan_influence: str = "none"
         self._grid_supplement_count: int = 0
+        # Battery Assist floor hysteresis. Appliance IDs whose assist dropped
+        # below the SoC floor; they re-engage only at floor + hysteresis. Lives
+        # on the Optimizer instance, which the coordinator keeps across cycles.
+        self._assist_blocked: set[str] = set()
+        self._battery_soc: float | None = None
 
     def optimize(
         self,
@@ -104,6 +116,7 @@ class Optimizer:
         """
         self._plan_influence = plan_influence
         self._grid_supplement_count = 0
+        self._battery_soc = power_state.battery_soc
 
         # Build lookup of appliance states by ID
         state_by_id: dict[str, ApplianceState] = {
@@ -904,7 +917,13 @@ class Optimizer:
                 else:
                     current_power = appliance.nominal_power
                 excess_for_adjustment = min(instant_budget, avg_budget)
-                available = excess_for_adjustment + current_power
+                solar_available = excess_for_adjustment + current_power
+                assist_factor = self._battery_assist_factor(appliance, battery_soc)
+                available = (
+                    solar_available * assist_factor
+                    if assist_factor > 1.0 and solar_available > 0
+                    else solar_available
+                )
                 raw_amps = available / (self.grid_voltage * phases)
                 target_amps = _step_floor(raw_amps, appliance.current_step)
 
@@ -920,11 +939,14 @@ class Optimizer:
 
                 if target_amps < appliance.min_current and not override_active:
                     # Not enough for minimum current and no override - SHED will handle turning off
-                    reason = _format_staying_on_dynamic(
-                        current_amperage=state.current_amperage,
-                        current_power=current_power,
-                        off_threshold=self._off_threshold,
-                        instant_budget=instant_budget,
+                    reason = self._with_assist_note(
+                        _format_staying_on_dynamic(
+                            current_amperage=state.current_amperage,
+                            current_power=current_power,
+                            off_threshold=self._off_threshold,
+                            instant_budget=instant_budget,
+                        ),
+                        appliance, battery_soc,
                     )
                     return (
                         ControlDecision(
@@ -942,17 +964,22 @@ class Optimizer:
                     target_amps = override_amps  # already capped by helper
                 power_at_target = target_amps * self.grid_voltage * phases
                 power_delta = power_at_target - current_power
+                assist_active = assist_factor > 1.0 and not override_active
+                if assist_active:
+                    # Only the solar-covered part is a claim on the solar budget;
+                    # the battery covers the rest of the draw.
+                    power_delta = min(solar_available, power_at_target) - current_power
                 if override_active:
                     # Override drives target above natural solar-supportable amps; the
                     # extra portion comes from grid. Tag the reason so SHED's
                     # grid-supplement guard skips this decision, and only deduct the
                     # solar-supportable delta from the budget so other appliances
                     # are not collateral-shed.
-                    natural_power = available  # excess_for_adjustment + current_power
+                    natural_power = solar_available  # excess_for_adjustment + current_power
                     solar_delta = max(natural_power - current_power, 0.0)
                     reason = (
                         f"Grid supplement (cheap-window target): {target_amps:.1f}A "
-                        f"({power_at_target:.0f}W, {available:.0f}W solar-supportable)"
+                        f"({power_at_target:.0f}W, {solar_available:.0f}W solar-supportable)"
                     )
                     return (
                         ControlDecision(
@@ -969,7 +996,17 @@ class Optimizer:
                         appliance_id=appliance.id,
                         action=Action.SET_CURRENT,
                         target_current=target_amps,
-                        reason=f"Dynamic current adjustment: {target_amps:.1f}A ({available:.0f}W available)",
+                        reason=(
+                            self._battery_assist_reason(
+                                appliance, solar_available, power_at_target, battery_soc,
+                            )
+                            if assist_active
+                            else self._with_assist_note(
+                                f"Dynamic current adjustment: {target_amps:.1f}A "
+                                f"({available:.0f}W available)",
+                                appliance, battery_soc,
+                            )
+                        ),
                         overrides_plan=False,
                     ),
                     power_delta,  # Only the delta from current consumption
@@ -1044,6 +1081,7 @@ class Optimizer:
         if appliance.dynamic_current:
             return self._allocate_dynamic_current(
                 appliance, state, avg_budget, tariff, plan,
+                battery_soc=battery_soc,
             )
 
         # --- Standard (on/off) appliances (currently OFF) ---
@@ -1218,6 +1256,7 @@ class Optimizer:
         avg_budget: float,
         tariff: TariffInfo,
         plan: Plan | None = None,
+        battery_soc: float | None = None,
     ) -> tuple[ControlDecision, float]:
         """Allocate a dynamic current appliance (e.g., EV charger).
 
@@ -1249,7 +1288,16 @@ class Optimizer:
 
         min_watts_needed = appliance.min_current * self.grid_voltage * phases + dynamic_buffer
 
-        if avg_budget < min_watts_needed:
+        # Battery Assist: the battery may cover part of the draw, so the sun
+        # only has to cover `share` of it. Scale the solar figure by 1/share.
+        assist_factor = self._battery_assist_factor(appliance, battery_soc)
+        assist_budget = (
+            avg_budget * assist_factor
+            if assist_factor > 1.0 and avg_budget > 0
+            else avg_budget
+        )
+
+        if assist_budget < min_watts_needed:
             # Not enough excess — try grid supplementation if tariff is cheap
             if (
                 appliance.allow_grid_supplement
@@ -1320,23 +1368,31 @@ class Optimizer:
                         min_power,
                     )
 
+            if assist_factor > 1.0:
+                idle_reason = format_battery_assist_waiting(
+                    max(avg_budget, 0.0), min_watts_needed / assist_factor,
+                    100.0 / assist_factor, battery_soc, appliance.battery_assist_min_soc,
+                )
+            else:
+                idle_reason = self._with_assist_note(
+                    f"Insufficient excess for min current "
+                    f"({avg_budget:.0f}W < {min_watts_needed:.0f}W needed "
+                    f"[{appliance.min_current:.1f}A * {self.grid_voltage}V * {phases} + "
+                    f"{dynamic_buffer:.0f}W buffer])",
+                    appliance, battery_soc,
+                )
             return (
                 ControlDecision(
                     appliance_id=appliance.id,
                     action=Action.IDLE,
                     target_current=None,
-                    reason=(
-                        f"Insufficient excess for min current "
-                        f"({avg_budget:.0f}W < {min_watts_needed:.0f}W needed "
-                        f"[{appliance.min_current:.1f}A * {self.grid_voltage}V * {phases} + "
-                        f"{dynamic_buffer:.0f}W buffer])"
-                    ),
+                    reason=idle_reason,
                     overrides_plan=False,
                 ),
                 0.0,
             )
 
-        raw_amps = avg_budget / (self.grid_voltage * phases)
+        raw_amps = assist_budget / (self.grid_voltage * phases)
         clamped_amps = _step_floor(raw_amps, appliance.current_step)
 
         natural_target_amps = max(appliance.min_current, min(clamped_amps, appliance.max_current))
@@ -1367,15 +1423,94 @@ class Optimizer:
                 natural_power,
             )
 
+        if assist_factor > 1.0:
+            return (
+                ControlDecision(
+                    appliance_id=appliance.id,
+                    action=Action.SET_CURRENT,
+                    target_current=target_amps,
+                    reason=self._battery_assist_reason(
+                        appliance, avg_budget, power_consumed, battery_soc,
+                    ),
+                    overrides_plan=False,
+                ),
+                # Only the solar-covered part is a claim on the solar budget.
+                min(max(avg_budget, 0.0), power_consumed),
+            )
+
         return (
             ControlDecision(
                 appliance_id=appliance.id,
                 action=Action.SET_CURRENT,
                 target_current=target_amps,
-                reason=f"Dynamic current set to {target_amps:.1f}A ({power_consumed:.0f}W)",
+                reason=self._with_assist_note(
+                    f"Dynamic current set to {target_amps:.1f}A ({power_consumed:.0f}W)",
+                    appliance, battery_soc,
+                ),
                 overrides_plan=False,
             ),
             power_consumed,
+        )
+
+    # ------------------------------------------------------------------
+    # Battery Assist (solar-led)
+    # ------------------------------------------------------------------
+
+    def _battery_assist_factor(
+        self, appliance: ApplianceConfig, battery_soc: float | None,
+    ) -> float:
+        """Return 1.0 (plain solar) or 1/share while Battery Assist is engaged.
+
+        share = 1 - max_share/100, max share capped at 90% so the factor is at
+        most 10. Engaged only when the switch is on, max share > 0 and battery
+        SoC is known and >= the floor. After SoC drops below the floor the
+        appliance is held out (``_assist_blocked``) until SoC >= floor + 2%.
+        """
+        max_share = min(max(appliance.battery_assist_max_share, 0.0), MAX_BATTERY_ASSIST_SHARE)
+        if not appliance.battery_assist_enabled or max_share <= 0:
+            self._assist_blocked.discard(appliance.id)
+            return 1.0
+        if battery_soc is None:
+            return 1.0
+        floor = appliance.battery_assist_min_soc
+        if battery_soc < floor:
+            self._assist_blocked.add(appliance.id)
+            return 1.0
+        if appliance.id in self._assist_blocked:
+            if battery_soc < floor + BATTERY_ASSIST_SOC_HYSTERESIS:
+                return 1.0
+            self._assist_blocked.discard(appliance.id)
+        return 1.0 / (1.0 - max_share / 100.0)
+
+    def _with_assist_note(
+        self, reason: str, appliance: ApplianceConfig, battery_soc: float | None,
+    ) -> str:
+        """Prefix `reason` with why Battery Assist is idle, when it is switched on but not engaged."""
+        if (
+            not appliance.battery_assist_enabled
+            or appliance.battery_assist_max_share <= 0
+            or self._battery_assist_factor(appliance, battery_soc) > 1.0
+        ):
+            return reason
+        note = format_battery_assist_paused(
+            battery_soc,
+            appliance.battery_assist_min_soc,
+            appliance.battery_assist_min_soc + BATTERY_ASSIST_SOC_HYSTERESIS,
+        )
+        return f"{note}: {reason}"
+
+    def _battery_assist_reason(
+        self,
+        appliance: ApplianceConfig,
+        solar_w: float,
+        total_w: float,
+        battery_soc: float | None,
+    ) -> str:
+        """Status text for a decision made while Battery Assist is engaged."""
+        return format_battery_assist_active(
+            min(max(solar_w, 0.0), total_w), total_w,
+            battery_soc if battery_soc is not None else 0.0,
+            appliance.battery_assist_min_soc,
         )
 
     # ------------------------------------------------------------------
@@ -1913,7 +2048,12 @@ class Optimizer:
         # Available power = current consumption + instant_budget
         # (instant_budget is negative when committed decisions would draw
         # grid power, so this reduces the available power)
-        available_power = current_power + instant_budget
+        # Battery Assist: instant_budget is a solar-only deficit; the battery
+        # covers part of the car's draw, so the car may shrink by deficit/share.
+        assist_factor = self._battery_assist_factor(appliance, self._battery_soc)
+        available_power = current_power + (
+            instant_budget * assist_factor if assist_factor > 1.0 else instant_budget
+        )
         if available_power <= 0:
             return None, 0.0
 
@@ -1925,7 +2065,8 @@ class Optimizer:
 
         new_amps = min(new_amps, appliance.max_current)
         new_power = new_amps * self.grid_voltage * phases
-        power_freed = current_power - new_power
+        # Only the solar-covered part of the reduction frees solar budget.
+        power_freed = (current_power - new_power) / assist_factor
 
         decision = ControlDecision(
             appliance_id=appliance.id,

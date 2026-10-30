@@ -444,3 +444,38 @@ def _find_matching_plan_entry(
             if start_naive <= now_naive <= end_naive:
                 return entry
     return None
+
+
+def format_battery_assist_active(
+    solar_w: float, total_w: float, soc: float, floor: float,
+) -> str:
+    """Status text while Battery Assist is topping up the sun with the battery."""
+    total = max(total_w, 1.0)
+    solar_pct = max(0.0, min(solar_w / total * 100.0, 100.0))
+    battery_kw = max(total_w - solar_w, 0.0) / 1000.0
+    return (
+        f"Battery assist: {solar_pct:.0f}% solar, ~{battery_kw:.1f} kW from battery "
+        f"(SoC {soc:.0f}% >= {floor:.0f}%)"
+    )
+
+
+def format_battery_assist_waiting(
+    solar_w: float, needed_w: float, solar_pct: float, soc: float, floor: float,
+) -> str:
+    """Status text when Battery Assist is active but the sun is too weak to start."""
+    return (
+        f"Battery assist: waiting for sun ({solar_w:.0f}W < {needed_w:.0f}W needed "
+        f"at {solar_pct:.0f}% solar, SoC {soc:.0f}% >= {floor:.0f}%)"
+    )
+
+
+def format_battery_assist_paused(
+    soc: float | None, floor: float, resume_at: float,
+) -> str:
+    """Prefix explaining why Battery Assist is not helping right now."""
+    if soc is None:
+        return "Battery assist paused (battery SoC unavailable)"
+    return (
+        f"Battery assist paused (SoC {soc:.0f}% below {floor:.0f}% floor, "
+        f"resumes at {resume_at:.0f}%)"
+    )

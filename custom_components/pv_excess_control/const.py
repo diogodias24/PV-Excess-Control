@@ -209,6 +209,18 @@ CONF_NOTIFY_APPLIANCE_OFF = "notify_appliance_off"
 CONF_NOTIFY_DAILY_SUMMARY = "notify_daily_summary"
 CONF_SWITCH_INTERVAL = "switch_interval"
 CONF_RESTART_INTERVAL = "restart_interval"
+
+# Battery Assist (solar-led): runtime knobs per dynamic-current appliance.
+# Numbers persist in subentry data under these keys; the switch persists a list
+# of appliance IDs in config_entry.data under CONF_BATTERY_ASSIST_APPLIANCES.
+CONF_BATTERY_ASSIST_MAX_SHARE = "battery_assist_max_share"
+CONF_BATTERY_ASSIST_MIN_SOC = "battery_assist_min_soc"
+CONF_BATTERY_ASSIST_APPLIANCES = "battery_assist_appliances"
+BATTERY_ASSIST_SEED_ENTITY = "input_number.battery_assist_threshold"
+DEFAULT_BATTERY_ASSIST_MAX_SHARE = 30.0  # percent of the car's draw the battery may cover
+DEFAULT_BATTERY_ASSIST_MIN_SOC = 61.0  # percent; floor below which the battery is not used
+MAX_BATTERY_ASSIST_SHARE = 90.0  # cap: the sun always covers >= 10%
+BATTERY_ASSIST_SOC_HYSTERESIS = 2.0  # percent above the floor needed to re-engage
 CONF_AVERAGING_WINDOW = "averaging_window"
 CONF_REQUIRES_APPLIANCE = "requires_appliance"
 CONF_HELPER_ONLY = "helper_only"
