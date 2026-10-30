@@ -120,6 +120,19 @@ Die Integration nutzt einen hybriden Ansatz aus Echtzeitsteuerung und Planung:
 - **Vorausschauender Planer** (alle 15 Min) - Erstellt optimale 24-Stunden-Zeitpläne anhand von Prognose- und Tarifdaten
 - **Pure-Logic Optimierer** - Keine HA-Abhängigkeiten, vollständig durch Unit-Tests abgedeckte Entscheidungs-Engine
 
+## Änderungen in diesem Fork
+
+Dieser Fork ergänzt den Upstream-Stand `b8cfc33` um Folgendes:
+
+- **Battery Assist (solargeführt):** Ein Modus pro Gerät, in dem die Heimbatterie einen begrenzten Anteil der Leistung eines Geräts mit dynamischem Strom (z. B. einer Wallbox) übernimmt, während die Sonne den Rest liefert, bis hinunter zu einer Batterie-SoC-Untergrenze. Siehe [ADR 0001](docs/adr/0001-battery-assist-solar-led.md) (auf Englisch).
+- **Sicherheitsbremse:** Laufende Geräte werden sofort auf den Mindeststrom zurückgenommen, wenn der Netzbezug eine Grenze überschreitet oder die PV-Leistung stark einbricht.
+- **Drosselung des dynamischen Stroms:** Ein Mindestintervall und eine Mindeständerung in Ampere begrenzen, wie oft der Ladestrom neu geschrieben wird, um ratenbegrenzte Cloud-Ladegeräte zu schonen. Siehe [Dynamischer Strom](docs/features/dynamic-current.md).
+- **Neustart-Intervall:** Eine eigene Wartezeit für das Wiedereinschalten eines Geräts, damit Abschalt- und Wiedereinschaltsperre getrennt eingestellt werden können.
+- **Batterie-SoC-Hysterese:** Nachdem der Mindest-SoC-Schutz ausgelöst hat, muss sich die Batterie um einen einstellbaren Wert erholen, bevor Geräte wieder erlaubt werden.
+- **Start-Schwelle pro Gerät:** Ein optionaler Mindest-Batterie-SoC, den ein Gerät zum Starten braucht.
+- **E-Auto-Schutzfunktionen:** Ein „lädt nicht"-Schutz, eine Zuhause-Bedingung und die Option, den Ziel-SoC des Autos aus einer Entität zu übernehmen.
+- **Abhängigkeiten:** Ein fehlender Statuswert gilt nicht mehr als „Abhängigkeit aus".
+
 ## Unterstütze dieses Projekt
 
 PV Excess Control wurde entwickelt, um dir dabei zu helfen, deine Stromrechnung nachhaltig zu senken und deine Solarinvestition zu maximieren. Wenn diese Integration einen messbaren Mehrwert für dein Zuhause bringt und du die kontinuierliche Weiterentwicklung unterstützen möchtest, würde ich mich freuen wenn du mich [auf GitHub sponsern](https://github.com/sponsors/InventoCasa) möchtest oder mir [einen Kaffee spendierst ☕](https://buymeacoffee.com/henrikic). Jede Spende hilft, den Sourcecode dieses Projektes weiterhin kostenfrei und aktiv maintained zur Verfügung zu stellen.

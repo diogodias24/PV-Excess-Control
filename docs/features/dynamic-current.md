@@ -32,6 +32,28 @@ Enable **Dynamic Current** on the appliance:
 | Max Current | `16` or `32` | EVSE or circuit maximum |
 | Current Step | `1.0` | Resolution of current adjustments (default: 0.1 A). Set to 1.0 for chargers that only accept whole-amp values. |
 | Phases | `3` | 1 or 3 phase |
+| Min Current Change Interval | `300` | Minimum seconds between current writes. `0` (default) writes every cycle. See below. |
+| Min Current Change | `1.0` | Only write when the current changes by at least this many amps. `0` (default) disables the buffer. |
+| Apply Current Reductions Immediately | on | When on (default), current *decreases* bypass the interval/buffer so you never import from the grid. Turn off to throttle both directions. |
+
+---
+
+## Limiting API Calls (Tesla / TeslaFi and rate-limited chargers)
+
+By default the integration rewrites the charging current every cycle (every 30 s) whenever the computed target moves by at least one **Current Step**. For most local chargers this is free. But some cloud-backed integrations bill or rate-limit every command:
+
+- **TeslaFi** allows only ~500 commands/month on its free tier
+- **Tesla Fleet API** allows ~10,000 commands/month
+
+Adjusting every 30 s can exhaust these limits within hours ([issue #41](https://github.com/InventoCasa/PV-Excess-Control/issues/41)).
+
+Three per-appliance settings throttle the writes (they only apply while the appliance is already running):
+
+- **Min Current Change Interval** — the main control. Set it to e.g. `300` so the current is rewritten at most once every 5 minutes. A typical charging session then needs a handful of commands instead of hundreds.
+- **Min Current Change** — skips writes for tiny adjustments (e.g. ignore changes smaller than `1.0 A`).
+- **Apply Current Reductions Immediately** — keep this **on** if you have **no home battery**: a sudden drop in excess (clouds) will lower the current straight away so you don't draw from the grid, while *increases* still respect the interval. With a hybrid/battery system you may turn it off to throttle both directions and minimise commands further (the battery absorbs the short-term mismatch).
+
+All three default to the original write-every-cycle behaviour, so existing setups are unchanged until you opt in.
 
 ---
 

@@ -121,6 +121,19 @@ The integration uses a hybrid real-time + planning approach:
 - **Forward-Looking Planner** (every 15 min) - Creates optimal 24-hour schedules using forecast and tariff data
 - **Pure-Logic Optimizer** - Zero HA dependencies, fully unit-testable decision engine
 
+## Fork changes
+
+This fork adds the following on top of the upstream `b8cfc33` release:
+
+- **Battery Assist (solar-led):** a per-appliance mode where the home battery covers a capped share of a dynamic-current appliance's draw (for example an EV charger) while the sun covers the rest, down to a battery SoC floor. See [ADR 0001](docs/adr/0001-battery-assist-solar-led.md).
+- **Safety brake:** running appliances are cut back to minimum current at once when grid import exceeds a cap or PV output drops sharply.
+- **Dynamic-current throttle:** a minimum interval and a minimum amp change limit how often the charging current is rewritten, to protect rate-limited cloud chargers. See [Dynamic Current](docs/features/dynamic-current.md).
+- **Restart interval:** a separate cooldown for turning an appliance back on, so the shed cooldown and the restart wait can be tuned independently.
+- **Battery SoC hysteresis:** after the minimum-SoC protection trips, the battery must recover by a set margin before appliances are re-allowed.
+- **Start threshold per appliance:** an optional minimum battery SoC an appliance needs before it may start.
+- **EV guards:** a not-charging guard, a car-at-home gate and an option to follow the car's own target SoC from an entity.
+- **Dependencies:** a missing state reading no longer counts as "dependency off".
+
 ## Support this project
 
 PV Excess Control is designed to reduce your energy bills and maximize your solar investment. If this integration brings measurable value to your home and you'd like to support its ongoing development, consider [sponsoring me on GitHub](https://github.com/sponsors/InventoCasa) or [buying me a coffee ☕](https://buymeacoffee.com/henrikic). Every contribution helps keep the code open and actively maintained.
