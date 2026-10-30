@@ -60,7 +60,6 @@ async def async_setup_entry(
             PvApplianceActivationsSensor(coordinator, subentry_id, appliance_name),
             PvApplianceStatusSensor(coordinator, subentry_id, appliance_name),
         ])
-
     async_add_entities(entities)
 
 
@@ -413,14 +412,19 @@ class PvApplianceStatusSensor(PvApplianceBaseSensor):
             battery_action = BatteryDischargeAction(should_limit=False)
 
         plan = data.get("current_plan")
+        applied_currents = data.get("applied_currents", {})
+        current_change_ts = data.get("current_change_ts", {})
         return format_status(
             decision,
             state,
             config,
             switch_interval=config.switch_interval,
+            restart_interval=config.restart_interval,
             battery_action=battery_action,
             plan=plan,
             now=datetime.now(),
+            applied_current=applied_currents.get(self._appliance_id),
+            current_change_ts=current_change_ts.get(self._appliance_id),
         )
 
     @property
@@ -446,4 +450,7 @@ class PvApplianceStatusSensor(PvApplianceBaseSensor):
             "plan_window_end": (
                 fs.plan_window_end.isoformat() if fs.plan_window_end else None
             ),
+            "not_drawing_power": fs.not_drawing_power,
+            "current_deferred": fs.current_deferred,
+            "current_deferred_seconds": fs.current_deferred_seconds,
         }

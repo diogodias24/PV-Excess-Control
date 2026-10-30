@@ -94,6 +94,7 @@ def _make_config(
     *,
     appliance_id: str = "app1",
     is_big_consumer: bool = False,
+    dynamic_current_interval: int = 0,
 ) -> ApplianceConfig:
     """Minimal ApplianceConfig fixture — only fields read by the formatter."""
     return ApplianceConfig(
@@ -119,6 +120,7 @@ def _make_config(
         switch_interval=300,
         allow_grid_supplement=False,
         max_grid_power=None,
+        dynamic_current_interval=dynamic_current_interval,
     )
 
 
@@ -147,11 +149,12 @@ def _make_decision(
     action: Action = Action.ON,
     reason: str = "Excess available (2100W >= 1800W needed)",
     overrides_plan: bool = False,
+    target_current: int | None = None,
 ) -> ControlDecision:
     return ControlDecision(
         appliance_id=appliance_id,
         action=action,
-        target_current=None,
+        target_current=target_current,
         reason=reason,
         overrides_plan=overrides_plan,
     )
@@ -184,6 +187,34 @@ class TestFormatStatusCooldown:
         )
         assert fs.text == (
             "Excess available (2100W >= 1800W needed) "
+            "(switch deferred - 50s cooldown)"
+        )
+        assert fs.switch_deferred is True
+        assert fs.cooldown_seconds_remaining == 50
+
+    def test_set_current_on_off_appliance_within_cooldown_appends_suffix(self) -> None:
+        # SET_CURRENT against a physically-OFF appliance is a re-enable; the
+        # apply phase writes the current AND turns it on, and that write is
+        # switch-interval gated too. Within cooldown the status must say so
+        # instead of implying the appliance is running.
+        decision = _make_decision(
+            action=Action.SET_CURRENT,
+            target_current=32,
+            reason="Dynamic current set to 32.0A (7360W)",
+        )
+        state = _make_state(
+            is_on=False,
+            last_state_change=self.NOW - timedelta(seconds=10),
+        )
+        fs = format_status(
+            decision, state, _make_config(),
+            switch_interval=60,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.text == (
+            "Dynamic current set to 32.0A (7360W) "
             "(switch deferred - 50s cooldown)"
         )
         assert fs.switch_deferred is True
@@ -255,6 +286,69 @@ class TestFormatStatusCooldown:
         )
         assert "(switch deferred" not in fs.text
         assert fs.switch_deferred is False
+
+    def test_restart_interval_gates_re_enable(self) -> None:
+        # Appliance OFF, last stop 120s ago; restart_interval 600s (switch
+        # only 60s). The re-enable must respect the longer restart interval.
+        decision = _make_decision(
+            action=Action.ON, reason="Excess available (2100W >= 1800W needed)"
+        )
+        state = _make_state(
+            is_on=False,
+            last_state_change=self.NOW - timedelta(seconds=120),
+        )
+        fs = format_status(
+            decision, state, _make_config(),
+            switch_interval=60,
+            restart_interval=600,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.text.endswith("(switch deferred - 8min cooldown)")
+        assert fs.switch_deferred is True
+        assert fs.cooldown_seconds_remaining == 480
+
+    def test_restart_interval_does_not_gate_shed(self) -> None:
+        # Running appliance, shed-OFF gated by switch_interval only — the
+        # longer restart_interval must not extend the hold-after-start.
+        decision = _make_decision(
+            action=Action.OFF, reason="Insufficient excess (1200W < 1800W needed)"
+        )
+        state = _make_state(
+            is_on=True,
+            last_state_change=self.NOW - timedelta(seconds=120),
+        )
+        fs = format_status(
+            decision, state, _make_config(),
+            switch_interval=60,
+            restart_interval=600,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert "(switch deferred" not in fs.text
+        assert fs.switch_deferred is False
+        assert fs.cooldown_seconds_remaining is None
+
+    def test_restart_interval_unset_falls_back_to_switch(self) -> None:
+        # restart_interval default (None) → the re-enable is gated by
+        # switch_interval, preserving the original single-knob behaviour.
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(
+            is_on=False,
+            last_state_change=self.NOW - timedelta(seconds=10),
+        )
+        fs = format_status(
+            decision, state, _make_config(),
+            switch_interval=60,
+            restart_interval=None,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.text.endswith("(switch deferred - 50s cooldown)")
+        assert fs.cooldown_seconds_remaining == 50
 
     def test_bypasses_cooldown_flag_suppresses_suffix(self) -> None:
         # Safety OFF decision should never show cooldown suffix even within interval
@@ -827,3 +921,256 @@ class TestFormatStatusCombined:
         )
         assert fs.text == expected
         assert "[battery discharge" not in fs.text
+
+
+# ---------------------------------------------------------------------------
+# S5 — "commanded on but not drawing power" (Feature B)
+# ---------------------------------------------------------------------------
+
+import dataclasses
+
+
+class TestFormatStatusNotDrawing:
+    """S5 — surface when an appliance is commanded on and HA reports it ON,
+    but the measured power draw is ~0 (device not confirmed running, e.g. an
+    EV charger whose car has gone to sleep)."""
+
+    NOW = datetime(2026, 4, 6, 12, 0, 0)
+    # last state change well outside the 90s grace window
+    OLD = NOW - timedelta(seconds=300)
+
+    def _config(
+        self,
+        *,
+        actual_power_entity: str | None = "sensor.ev_power",
+        completion_power_threshold: float | None = None,
+    ) -> ApplianceConfig:
+        return dataclasses.replace(
+            _make_config(),
+            actual_power_entity=actual_power_entity,
+            completion_power_threshold=completion_power_threshold,
+        )
+
+    def test_commanded_on_but_zero_draw_flags(self) -> None:
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(is_on=True, current_power=0.0, last_state_change=self.OLD)
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is True
+        assert "[on but 0W — device not confirmed running]" in fs.text
+
+    def test_set_current_zero_draw_flags(self) -> None:
+        # The exact reported scenario: SET_CURRENT (e.g. "12A") but no draw.
+        decision = _make_decision(
+            action=Action.SET_CURRENT,
+            reason="Dynamic current adjustment: 12.0A (2760W available)",
+        )
+        state = _make_state(is_on=True, current_power=0.0, last_state_change=self.OLD)
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is True
+        assert fs.text.startswith("Dynamic current adjustment: 12.0A")
+        assert "device not confirmed running" in fs.text
+
+    def test_no_actual_power_entity_never_flags(self) -> None:
+        # Without a real measurement, current_power is an estimate — never flag.
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(is_on=True, current_power=0.0, last_state_change=self.OLD)
+        fs = format_status(
+            decision, state, self._config(actual_power_entity=None),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is False
+        assert "device not confirmed running" not in fs.text
+
+    def test_within_grace_period_no_flag(self) -> None:
+        # Just turned on — give the device time to ramp before flagging.
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(
+            is_on=True, current_power=0.0,
+            last_state_change=self.NOW - timedelta(seconds=30),
+        )
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is False
+
+    def test_drawing_normally_no_flag(self) -> None:
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(is_on=True, current_power=1500.0, last_state_change=self.OLD)
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is False
+
+    def test_switch_reported_off_no_flag(self) -> None:
+        # HA reports the switch OFF — there is no contradiction to surface.
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(is_on=False, current_power=0.0, last_state_change=self.OLD)
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is False
+
+    def test_off_decision_no_flag(self) -> None:
+        decision = _make_decision(action=Action.OFF, reason="Shed: insufficient excess")
+        state = _make_state(is_on=True, current_power=0.0, last_state_change=self.OLD)
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is False
+
+    def test_completion_threshold_used_as_draw_floor(self) -> None:
+        # When completion_power_threshold is set it defines "not drawing".
+        cfg = self._config(completion_power_threshold=200.0)
+        decision = _make_decision(action=Action.ON)
+        # 150W < 200W threshold → not drawing
+        state_low = _make_state(is_on=True, current_power=150.0, last_state_change=self.OLD)
+        fs_low = format_status(
+            decision, state_low, cfg,
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT,
+            plan=None, now=self.NOW,
+        )
+        assert fs_low.not_drawing_power is True
+        # 250W >= 200W threshold → drawing
+        state_hi = _make_state(is_on=True, current_power=250.0, last_state_change=self.OLD)
+        fs_hi = format_status(
+            decision, state_hi, cfg,
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT,
+            plan=None, now=self.NOW,
+        )
+        assert fs_hi.not_drawing_power is False
+
+    def test_last_state_change_none_skips_grace(self) -> None:
+        # No recorded change time → grace check is skipped; other conditions met.
+        decision = _make_decision(action=Action.ON)
+        state = _make_state(is_on=True, current_power=0.0, last_state_change=None)
+        fs = format_status(
+            decision, state, self._config(),
+            switch_interval=300,
+            battery_action=_NO_BATTERY_LIMIT,
+            plan=None,
+            now=self.NOW,
+        )
+        assert fs.not_drawing_power is True
+
+
+class TestFormatStatusCurrentHold:
+    """Dynamic-current throttle: status reports the HELD (applied) current,
+    not the optimizer's unapplied per-cycle target."""
+
+    NOW = datetime(2026, 6, 25, 11, 0, 0)
+
+    def _set_current_decision(self, target):
+        return ControlDecision(
+            appliance_id="app1",
+            action=Action.SET_CURRENT,
+            target_current=target,
+            reason=f"Dynamic current adjustment: {target:.1f}A (5000W available)",
+            overrides_plan=False,
+        )
+
+    def test_throttled_change_shows_held_current_and_countdown(self) -> None:
+        # Optimizer wants 22A, but 16A is applied and we're 60s into a 300s
+        # interval → status holds at 16A and counts down ~240s.
+        decision = self._set_current_decision(22.0)
+        state = _make_state(is_on=True)
+        fs = format_status(
+            decision, state, _make_config(dynamic_current_interval=300),
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT, plan=None,
+            now=self.NOW,
+            applied_current=16.0,
+            current_change_ts=self.NOW - timedelta(seconds=60),
+        )
+        assert fs.text == "Holding 16.0A - target 22.0A deferred (4min)"
+        assert fs.current_deferred is True
+        assert fs.current_deferred_seconds == 240
+
+    def test_target_equals_applied_uses_normal_reason(self) -> None:
+        decision = self._set_current_decision(16.0)
+        state = _make_state(is_on=True)
+        fs = format_status(
+            decision, state, _make_config(dynamic_current_interval=300),
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT, plan=None,
+            now=self.NOW, applied_current=16.0,
+            current_change_ts=self.NOW - timedelta(seconds=60),
+        )
+        assert fs.text == decision.reason
+        assert fs.current_deferred is False
+        assert fs.current_deferred_seconds is None
+
+    def test_no_applied_current_uses_normal_reason(self) -> None:
+        decision = self._set_current_decision(22.0)
+        fs = format_status(
+            decision, _make_state(is_on=True),
+            _make_config(dynamic_current_interval=300),
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT, plan=None,
+            now=self.NOW, applied_current=None, current_change_ts=None,
+        )
+        assert fs.text == decision.reason
+        assert fs.current_deferred is False
+
+    def test_min_delta_hold_without_interval_has_no_countdown(self) -> None:
+        # interval=0 (delta-only throttle): held, but no time component.
+        decision = self._set_current_decision(17.0)
+        fs = format_status(
+            decision, _make_state(is_on=True),
+            _make_config(dynamic_current_interval=0),
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT, plan=None,
+            now=self.NOW, applied_current=16.0, current_change_ts=None,
+        )
+        assert fs.text == "Holding 16.0A - target 17.0A deferred"
+        assert fs.current_deferred is True
+        assert fs.current_deferred_seconds is None
+
+    def test_appliance_off_not_deferred(self) -> None:
+        decision = self._set_current_decision(22.0)
+        fs = format_status(
+            decision, _make_state(is_on=False),
+            _make_config(dynamic_current_interval=300),
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT, plan=None,
+            now=self.NOW, applied_current=16.0,
+            current_change_ts=self.NOW - timedelta(seconds=60),
+        )
+        assert fs.current_deferred is False
+        assert fs.text == decision.reason
+
+    def test_non_set_current_action_not_deferred(self) -> None:
+        decision = _make_decision(action=Action.ON, reason="Excess available")
+        fs = format_status(
+            decision, _make_state(is_on=True),
+            _make_config(dynamic_current_interval=300),
+            switch_interval=300, battery_action=_NO_BATTERY_LIMIT, plan=None,
+            now=self.NOW, applied_current=16.0,
+            current_change_ts=self.NOW - timedelta(seconds=60),
+        )
+        assert fs.current_deferred is False

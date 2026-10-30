@@ -69,6 +69,8 @@ from .const import (
     CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
     CONF_BATTERY_MAX_DISCHARGE_ENTITY,
     CONF_MIN_BATTERY_SOC,
+    CONF_MIN_BATTERY_SOC_HYSTERESIS,
+    DEFAULT_MIN_BATTERY_SOC_HYSTERESIS,
     CONF_BATTERY_CHARGE_POWER,
     CONF_BATTERY_DISCHARGE_POWER,
     CONF_BATTERY_POWER,
@@ -86,8 +88,12 @@ from .const import (
     CONF_ENABLE_PREEMPTION,
     CONF_END_BEFORE,
     CONF_EV_CONNECTED_ENTITY,
+    CONF_EV_CHARGING_ENTITY,
+    CONF_EV_FOLLOW_TARGET_SOC,
+    CONF_EV_HOME_ENTITY,
     CONF_EV_SOC_ENTITY,
     CONF_EV_TARGET_SOC,
+    CONF_EV_TARGET_SOC_ENTITY,
     CONF_EXPORT_LIMIT,
     CONF_FEED_IN_TARIFF,
     CONF_FEED_IN_TARIFF_SENSOR,
@@ -95,6 +101,7 @@ from .const import (
     CONF_FORECAST_SENSOR,
     CONF_FORECAST_TOMORROW_SENSOR,
     CONF_GRID_EXPORT,
+    CONF_GRID_IMPORT_CAP_W,
     CONF_GRID_VOLTAGE,
     CONF_IMPORT_EXPORT,
     CONF_INVERTER_TYPE,
@@ -106,6 +113,7 @@ from .const import (
     CONF_MAX_GRID_POWER,
     CONF_MIN_CURRENT,
     CONF_MIN_DAILY_RUNTIME,
+    CONF_MIN_BATTERY_SOC_START,
     CONF_NOMINAL_POWER,
     CONF_NOTIFICATION_SERVICE,
     CONF_NOTIFY_APPLIANCE_OFF,
@@ -119,6 +127,7 @@ from .const import (
     CONF_PLANNER_INTERVAL,
     CONF_PROTECT_FROM_PREEMPTION,
     CONF_PRICE_SENSOR,
+    CONF_PV_DROP_THRESHOLD_W,
     CONF_PV_POWER,
     CONF_HELPER_ONLY,
     CONF_REQUIRES_APPLIANCE,
@@ -126,13 +135,22 @@ from .const import (
     CONF_START_AFTER,
     CONF_AVERAGING_WINDOW,
     CONF_SWITCH_INTERVAL,
+    CONF_RESTART_INTERVAL,
+    CONF_DYNAMIC_CURRENT_INTERVAL,
+    CONF_DYNAMIC_CURRENT_MIN_DELTA,
+    CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
     CONF_TARIFF_PROVIDER,
     DEFAULT_CONTROLLER_INTERVAL,
     DEFAULT_GRID_CHARGE_ENGAGE_MIN_DURATION_MINUTES,
+    DEFAULT_GRID_IMPORT_CAP_W,
     DEFAULT_GRID_VOLTAGE,
     DEFAULT_OFF_THRESHOLD,
     DEFAULT_PLANNER_INTERVAL,
+    DEFAULT_PV_DROP_THRESHOLD_W,
     DEFAULT_SWITCH_INTERVAL,
+    DEFAULT_DYNAMIC_CURRENT_INTERVAL,
+    DEFAULT_DYNAMIC_CURRENT_MIN_DELTA,
+    DEFAULT_DYNAMIC_CURRENT_DECREASE_BYPASS,
     DOMAIN,
     MAX_CURRENT,
     MAX_PHASES,
@@ -211,6 +229,11 @@ SWITCH_ENTITY_SELECTOR = EntitySelector(
 
 BINARY_SENSOR_ENTITY_SELECTOR = EntitySelector(
     EntitySelectorConfig(domain="binary_sensor")
+)
+
+# Home-presence gate accepts a tracker/person/binary_sensor (e.g. device_tracker.tesla_location).
+PRESENCE_ENTITY_SELECTOR = EntitySelector(
+    EntitySelectorConfig(domain=["device_tracker", "person", "binary_sensor", "input_select"])
 )
 
 PHASE_OPTIONS = [
@@ -339,6 +362,41 @@ def _appliance_current_schema(defaults: dict[str, Any] | None = None) -> vol.Sch
                     mode=NumberSelectorMode.BOX,
                 )
             ),
+            vol.Required(
+                CONF_DYNAMIC_CURRENT_INTERVAL,
+                default=d.get(
+                    CONF_DYNAMIC_CURRENT_INTERVAL, DEFAULT_DYNAMIC_CURRENT_INTERVAL
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=3600,
+                    step=1,
+                    unit_of_measurement="s",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(
+                CONF_DYNAMIC_CURRENT_MIN_DELTA,
+                default=d.get(
+                    CONF_DYNAMIC_CURRENT_MIN_DELTA, DEFAULT_DYNAMIC_CURRENT_MIN_DELTA
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0,
+                    max=MAX_CURRENT,
+                    step=0.1,
+                    unit_of_measurement="A",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Required(
+                CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
+                default=d.get(
+                    CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
+                    DEFAULT_DYNAMIC_CURRENT_DECREASE_BYPASS,
+                ),
+            ): BooleanSelector(),
             vol.Optional(
                 CONF_EV_SOC_ENTITY,
                 description={"suggested_value": d.get(CONF_EV_SOC_ENTITY)},
@@ -347,6 +405,14 @@ def _appliance_current_schema(defaults: dict[str, Any] | None = None) -> vol.Sch
                 CONF_EV_CONNECTED_ENTITY,
                 description={"suggested_value": d.get(CONF_EV_CONNECTED_ENTITY)},
             ): BINARY_SENSOR_ENTITY_SELECTOR,
+            vol.Optional(
+                CONF_EV_CHARGING_ENTITY,
+                description={"suggested_value": d.get(CONF_EV_CHARGING_ENTITY)},
+            ): SENSOR_ENTITY_SELECTOR,
+            vol.Optional(
+                CONF_EV_HOME_ENTITY,
+                description={"suggested_value": d.get(CONF_EV_HOME_ENTITY)},
+            ): PRESENCE_ENTITY_SELECTOR,
             vol.Optional(
                 CONF_EV_TARGET_SOC,
                 default=d.get(CONF_EV_TARGET_SOC, 100),
@@ -360,6 +426,14 @@ def _appliance_current_schema(defaults: dict[str, Any] | None = None) -> vol.Sch
                     mode=NumberSelectorMode.SLIDER,
                 )
             ),
+            vol.Optional(
+                CONF_EV_FOLLOW_TARGET_SOC,
+                default=d.get(CONF_EV_FOLLOW_TARGET_SOC, False),
+            ): BooleanSelector(),
+            vol.Optional(
+                CONF_EV_TARGET_SOC_ENTITY,
+                description={"suggested_value": d.get(CONF_EV_TARGET_SOC_ENTITY)},
+            ): NUMBER_ENTITY_SELECTOR,
         }
     )
 
@@ -374,6 +448,18 @@ def _appliance_constraints_schema(
         vol.Required(
             CONF_SWITCH_INTERVAL,
             default=d.get(CONF_SWITCH_INTERVAL, DEFAULT_SWITCH_INTERVAL),
+        ): NumberSelector(
+            NumberSelectorConfig(
+                min=5,
+                max=3600,
+                step=1,
+                unit_of_measurement="s",
+                mode=NumberSelectorMode.BOX,
+            )
+        ),
+        vol.Optional(
+            CONF_RESTART_INTERVAL,
+            description={"suggested_value": d.get(CONF_RESTART_INTERVAL)},
         ): NumberSelector(
             NumberSelectorConfig(
                 min=5,
@@ -474,6 +560,17 @@ def _appliance_constraints_schema(
             CONF_END_BEFORE,
             description={"suggested_value": d.get(CONF_END_BEFORE)},
         ): TimeSelector(),
+        vol.Optional(
+            CONF_MIN_BATTERY_SOC_START,
+            description={"suggested_value": d.get(CONF_MIN_BATTERY_SOC_START)},
+        ): NumberSelector(
+            NumberSelectorConfig(
+                min=0,
+                max=100,
+                step=1,
+                mode=NumberSelectorMode.BOX,
+            )
+        ),
         vol.Required(
             CONF_ALLOW_GRID_SUPPLEMENT,
             default=d.get(CONF_ALLOW_GRID_SUPPLEMENT, False),
@@ -716,6 +813,18 @@ def _battery_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 )
             ),
             vol.Required(
+                CONF_MIN_BATTERY_SOC_HYSTERESIS,
+                default=d.get(
+                    CONF_MIN_BATTERY_SOC_HYSTERESIS,
+                    DEFAULT_MIN_BATTERY_SOC_HYSTERESIS,
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=50, step=1, unit_of_measurement="%",
+                    mode=NumberSelectorMode.SLIDER,
+                )
+            ),
+            vol.Required(
                 CONF_AUTO_BATTERY_GRID_CHARGE,
                 default=d.get(CONF_AUTO_BATTERY_GRID_CHARGE, False),
             ): BooleanSelector(),
@@ -825,6 +934,24 @@ def _settings_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
             ): NumberSelector(
                 NumberSelectorConfig(
                     min=0, max=100000, step=1, unit_of_measurement="W",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_GRID_IMPORT_CAP_W,
+                default=d.get(CONF_GRID_IMPORT_CAP_W, DEFAULT_GRID_IMPORT_CAP_W),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=20000, step=100, unit_of_measurement="W",
+                    mode=NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_PV_DROP_THRESHOLD_W,
+                default=d.get(CONF_PV_DROP_THRESHOLD_W, DEFAULT_PV_DROP_THRESHOLD_W),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=10000, step=100, unit_of_measurement="W",
                     mode=NumberSelectorMode.BOX,
                 )
             ),
@@ -1416,6 +1543,7 @@ class PvExcessControlOptionsFlow(config_entries.OptionsFlow):
                     CONF_BATTERY_MAX_DISCHARGE_ENTITY,
                     CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
                     CONF_MIN_BATTERY_SOC,
+                    CONF_MIN_BATTERY_SOC_HYSTERESIS,
                 ]:
                     self.data.pop(key, None)
 
@@ -1526,11 +1654,18 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
             if not dynamic and user_input.get(CONF_CHEAP_GRID_TARGET_CURRENT) is not None:
                 errors[CONF_CHEAP_GRID_TARGET_CURRENT] = "cheap_grid_target_current_requires_dynamic"
 
+            if user_input.get(CONF_EV_FOLLOW_TARGET_SOC) and not user_input.get(
+                CONF_EV_TARGET_SOC_ENTITY
+            ):
+                errors[CONF_EV_TARGET_SOC_ENTITY] = "missing_target_soc_entity"
+
             if not errors:
                 self._data.update(user_input)
                 # Clean optional current/EV keys not present in user_input
                 for key in [CONF_CURRENT_ENTITY, CONF_EV_SOC_ENTITY, CONF_EV_CONNECTED_ENTITY,
-                            CONF_EV_TARGET_SOC, CONF_CHEAP_GRID_TARGET_CURRENT]:
+                            CONF_EV_CHARGING_ENTITY, CONF_EV_HOME_ENTITY,
+                            CONF_EV_TARGET_SOC, CONF_EV_TARGET_SOC_ENTITY,
+                            CONF_CHEAP_GRID_TARGET_CURRENT]:
                     if key not in user_input:
                         self._data.pop(key, None)
                 return await self.async_step_constraints()
@@ -1571,6 +1706,9 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
             # Clean empty requires_appliance to None
             if user_input.get(CONF_REQUIRES_APPLIANCE) == "":
                 user_input.pop(CONF_REQUIRES_APPLIANCE, None)
+            # A cleared restart_interval means "fall back to switch_interval"
+            if user_input.get(CONF_RESTART_INTERVAL) is None:
+                user_input.pop(CONF_RESTART_INTERVAL, None)
 
             # Circular dependency check (only when we know our own subentry ID)
             req = user_input.get(CONF_REQUIRES_APPLIANCE)
@@ -1609,10 +1747,11 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
                 self._data.update(user_input)
                 # Clean optional constraint keys not present in user_input
                 for key in [CONF_MIN_DAILY_RUNTIME, CONF_MAX_DAILY_RUNTIME, CONF_SCHEDULE_DEADLINE,
-                            CONF_START_AFTER, CONF_END_BEFORE,
+                            CONF_START_AFTER, CONF_END_BEFORE, CONF_MIN_BATTERY_SOC_START,
                             CONF_MAX_GRID_POWER, CONF_BATTERY_DISCHARGE_OVERRIDE,
                             CONF_AVERAGING_WINDOW, CONF_REQUIRES_APPLIANCE,
-                            CONF_ON_THRESHOLD, CONF_COMPLETION_POWER_THRESHOLD]:
+                            CONF_ON_THRESHOLD, CONF_COMPLETION_POWER_THRESHOLD,
+                            CONF_RESTART_INTERVAL]:
                     if key not in user_input:
                         self._data.pop(key, None)
                 title = self._data.get(CONF_APPLIANCE_NAME, "Appliance")
@@ -1710,11 +1849,18 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
             if not dynamic and user_input.get(CONF_CHEAP_GRID_TARGET_CURRENT) is not None:
                 errors[CONF_CHEAP_GRID_TARGET_CURRENT] = "cheap_grid_target_current_requires_dynamic"
 
+            if user_input.get(CONF_EV_FOLLOW_TARGET_SOC) and not user_input.get(
+                CONF_EV_TARGET_SOC_ENTITY
+            ):
+                errors[CONF_EV_TARGET_SOC_ENTITY] = "missing_target_soc_entity"
+
             if not errors:
                 self._data.update(user_input)
                 # Clean optional current/EV keys not present in user_input
                 for key in [CONF_CURRENT_ENTITY, CONF_EV_SOC_ENTITY, CONF_EV_CONNECTED_ENTITY,
-                            CONF_EV_TARGET_SOC, CONF_CHEAP_GRID_TARGET_CURRENT]:
+                            CONF_EV_CHARGING_ENTITY, CONF_EV_HOME_ENTITY,
+                            CONF_EV_TARGET_SOC, CONF_EV_TARGET_SOC_ENTITY,
+                            CONF_CHEAP_GRID_TARGET_CURRENT]:
                     if key not in user_input:
                         self._data.pop(key, None)
                 return await self.async_step_reconfigure_constraints()
@@ -1751,6 +1897,9 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
             # Clean empty requires_appliance to None
             if user_input.get(CONF_REQUIRES_APPLIANCE) == "":
                 user_input.pop(CONF_REQUIRES_APPLIANCE, None)
+            # A cleared restart_interval means "fall back to switch_interval"
+            if user_input.get(CONF_RESTART_INTERVAL) is None:
+                user_input.pop(CONF_RESTART_INTERVAL, None)
 
             # Circular dependency check (only when we know our own subentry ID)
             req = user_input.get(CONF_REQUIRES_APPLIANCE)
@@ -1789,10 +1938,11 @@ class ApplianceSubentryFlowHandler(_SubentryBase):  # type: ignore[misc]
                 self._data.update(user_input)
                 # Clean optional constraint keys not present in user_input
                 for key in [CONF_MIN_DAILY_RUNTIME, CONF_MAX_DAILY_RUNTIME, CONF_SCHEDULE_DEADLINE,
-                            CONF_START_AFTER, CONF_END_BEFORE,
+                            CONF_START_AFTER, CONF_END_BEFORE, CONF_MIN_BATTERY_SOC_START,
                             CONF_MAX_GRID_POWER, CONF_BATTERY_DISCHARGE_OVERRIDE,
                             CONF_AVERAGING_WINDOW, CONF_REQUIRES_APPLIANCE,
-                            CONF_ON_THRESHOLD, CONF_COMPLETION_POWER_THRESHOLD]:
+                            CONF_ON_THRESHOLD, CONF_COMPLETION_POWER_THRESHOLD,
+                            CONF_RESTART_INTERVAL]:
                     if key not in user_input:
                         self._data.pop(key, None)
                 title = self._data.get(CONF_APPLIANCE_NAME, "Appliance")

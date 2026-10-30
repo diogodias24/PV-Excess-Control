@@ -238,6 +238,7 @@ def coordinator_factory():
         coord.appliance_states = {}
         coord.control_decisions = []
         coord.battery_discharge_action = None
+        coord._battery_soc_protection_active = False
         coord._planner_interval = entry.data.get(CONF_PLANNER_INTERVAL, DEFAULT_PLANNER_INTERVAL)
         coord._planner_counter = 0
         coord._startup_time = datetime.now()
@@ -255,10 +256,13 @@ def coordinator_factory():
         coord._last_discharge_limit = None
         coord._last_state_change = {}
         coord._last_applied_current = {}
+        coord._last_current_change_ts = {}
         coord._activations_today = {}
         coord._needed_by_others = set()
         coord._previous_is_on = {}
         coord._was_enabled = True
+        coord.appliance_switch_intervals = {}
+        coord.appliance_restart_intervals = {}
 
         tariff_type = entry.data.get(CONF_TARIFF_PROVIDER, TariffProviderEnum.NONE)
         coord._tariff_provider = create_tariff_provider(tariff_type, "")

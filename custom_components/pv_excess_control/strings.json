@@ -84,6 +84,7 @@
           "battery_max_discharge_entity": "Battery Max Discharge Entity",
           "battery_max_discharge_default": "Default Max Discharge Power (W)",
           "min_battery_soc": "Minimum Battery SoC (%)",
+          "min_battery_soc_hysteresis": "Battery SoC Re-enable Hysteresis (%)",
           "auto_battery_grid_charge": "Automatically force-charge battery during cheap tariff windows",
           "battery_grid_charge_power_w": "Forced grid-charge power (W)",
           "grid_charge_engage_min_duration_minutes": "Minimum engage duration (min)",
@@ -103,6 +104,7 @@
           "battery_max_discharge_entity": "Entity to control maximum battery discharge power.",
           "battery_max_discharge_default": "Default maximum discharge power when no override is active.",
           "min_battery_soc": "When battery SoC drops below this threshold, all non-essential appliances are shed and battery discharge is blocked. Leave empty to disable.",
+          "min_battery_soc_hysteresis": "Once SoC protection trips, the battery must climb this many points above the minimum before appliances are re-allowed. Prevents big consumers (e.g. EV chargers) flapping on/off at the threshold. 0 = no hysteresis.",
           "auto_battery_grid_charge": "When enabled, the coordinator will automatically engage force-charge mode during cheap tariff windows.",
           "battery_grid_charge_power_w": "Target charging power in Watts when force-charging from the grid.",
           "grid_charge_engage_min_duration_minutes": "Minimum number of minutes the cheap window must last before engaging force-charge.",
@@ -190,9 +192,16 @@
             "max_current": "Maximum Current (A)",
             "current_step": "Current Step Size (A)",
             "cheap_grid_target_current": "Cheap-window target current (A)",
+            "dynamic_current_interval": "Min Current Change Interval (s)",
+            "dynamic_current_min_delta": "Min Current Change (A)",
+            "dynamic_current_decrease_bypass": "Apply Current Reductions Immediately",
             "ev_soc_entity": "EV State of Charge Sensor",
             "ev_connected_entity": "EV Connected Sensor",
-            "ev_target_soc": "EV Target SoC"
+            "ev_charging_entity": "EV Charging State Sensor",
+            "ev_home_entity": "EV Home Presence Entity",
+            "ev_target_soc": "EV Target SoC",
+            "ev_follow_target_soc": "Follow target SoC from entity",
+            "ev_target_soc_entity": "Target SoC entity to follow"
           },
           "data_description": {
             "dynamic_current": "Enable to control this appliance by adjusting its current rather than simple on/off.",
@@ -201,9 +210,16 @@
             "max_current": "Maximum operating current in amperes.",
             "current_step": "Resolution of current adjustments. 0.1A for fine-grained control, 1.0A for whole-amp steps. Match this to your device's supported resolution.",
             "cheap_grid_target_current": "Target current during cheap tariff windows when grid supplementation is enabled. Defaults to max_current. Capped by max_grid_power if set. Leave empty to use min_current (legacy behaviour).",
+            "dynamic_current_interval": "Minimum time between dynamic charging-current adjustments. 0 = adjust every cycle (default). Raise this (e.g. 300) for EV chargers with monthly API command limits such as Tesla/TeslaFi.",
+            "dynamic_current_min_delta": "Only adjust the charging current when it changes by at least this many amps. 0 = no buffer (default).",
+            "dynamic_current_decrease_bypass": "When enabled, lowering the current is applied immediately, bypassing the interval and buffer above. Recommended without a home battery, to avoid importing from the grid. Disable to throttle increases and decreases equally.",
             "ev_soc_entity": "Sensor that reports the EV battery state of charge.",
             "ev_connected_entity": "Binary sensor that indicates whether the EV is connected.",
-            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)"
+            "ev_charging_entity": "Optional. Sensor that reports whether the EV is actively charging (e.g. sensor.tesla_charging with state 'charging'). Prevents unnecessary API calls when the car is connected but not drawing power.",
+            "ev_home_entity": "Optional. When the car is not at home per this entity (e.g. device_tracker.tesla_location), PV won't control it — prevents managing a charge away from home.",
+            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)",
+            "ev_follow_target_soc": "When enabled, read the EV target SoC live from the entity below (e.g. the car's own charge-limit number) instead of the slider above. The slider is used as a fallback when the entity is unavailable.",
+            "ev_target_soc_entity": "Number entity whose value is the EV target SoC to follow (e.g. number.tesla_charge_limit)."
           }
         },
         "constraints": {
@@ -211,6 +227,7 @@
           "description": "Configure runtime constraints, grid supplementation, and big consumer settings.",
           "data": {
             "switch_interval": "Minimum Switch Interval (s)",
+            "restart_interval": "Restart Interval (s)",
             "averaging_window": "Averaging Window (s)",
             "on_only": "On Only (never turn off)",
             "protect_from_preemption": "Protect From Preemption",
@@ -222,6 +239,7 @@
             "schedule_deadline": "Schedule Deadline",
             "start_after": "Start After",
             "end_before": "End Before",
+            "min_battery_soc_start": "Min Battery SoC to Start (%)",
             "allow_grid_supplement": "Allow Grid Supplementation",
             "max_grid_power": "Maximum Grid Power (W)",
             "cheap_price_threshold": "Cheap Price Threshold",
@@ -232,6 +250,7 @@
           },
           "data_description": {
             "switch_interval": "Minimum time between switching this appliance on and off.",
+            "restart_interval": "Minimum time to wait before this appliance can be switched back on after being turned off. Leave empty to use the Switch Interval.",
             "averaging_window": "Custom averaging window for excess power calculation. Shorter windows respond faster but may cause more switching. Leave empty to use the global default (1800 seconds / 30 minutes).",
             "on_only": "If enabled, this appliance will only be turned on, never automatically turned off.",
             "protect_from_preemption": "When enabled, this appliance will never be shed to make room for a higher-priority appliance.",
@@ -243,6 +262,7 @@
             "schedule_deadline": "Time by which the minimum daily runtime must be completed.",
             "start_after": "Earliest time this appliance may operate. Leave empty for no restriction.",
             "end_before": "Latest time this appliance may operate. Leave empty for no restriction.",
+            "min_battery_soc_start": "Don't start this appliance until the home battery has at least this charge level. Empty = disabled. Only blocks starting — a running appliance is not stopped.",
             "allow_grid_supplement": "Allow using grid power when the energy price is cheap. The price threshold can be configured below, or falls back to the global cheap price threshold.",
             "max_grid_power": "Maximum watts to draw from the grid during cheap-tariff supplementation.",
             "cheap_price_threshold": "Price threshold below which grid supplementation is allowed for this appliance. Leave empty to use the global threshold.",
@@ -282,9 +302,16 @@
             "max_current": "Maximum Current (A)",
             "current_step": "Current Step Size (A)",
             "cheap_grid_target_current": "Cheap-window target current (A)",
+            "dynamic_current_interval": "Min Current Change Interval (s)",
+            "dynamic_current_min_delta": "Min Current Change (A)",
+            "dynamic_current_decrease_bypass": "Apply Current Reductions Immediately",
             "ev_soc_entity": "EV State of Charge Sensor",
             "ev_connected_entity": "EV Connected Sensor",
-            "ev_target_soc": "EV Target SoC"
+            "ev_charging_entity": "EV Charging State Sensor",
+            "ev_home_entity": "EV Home Presence Entity",
+            "ev_target_soc": "EV Target SoC",
+            "ev_follow_target_soc": "Follow target SoC from entity",
+            "ev_target_soc_entity": "Target SoC entity to follow"
           },
           "data_description": {
             "dynamic_current": "Enable to control this appliance by adjusting its current rather than simple on/off.",
@@ -293,9 +320,16 @@
             "max_current": "Maximum operating current in amperes.",
             "current_step": "Resolution of current adjustments. 0.1A for fine-grained control, 1.0A for whole-amp steps. Match this to your device's supported resolution.",
             "cheap_grid_target_current": "Target current during cheap tariff windows when grid supplementation is enabled. Defaults to max_current. Capped by max_grid_power if set. Leave empty to use min_current (legacy behaviour).",
+            "dynamic_current_interval": "Minimum time between dynamic charging-current adjustments. 0 = adjust every cycle (default). Raise this (e.g. 300) for EV chargers with monthly API command limits such as Tesla/TeslaFi.",
+            "dynamic_current_min_delta": "Only adjust the charging current when it changes by at least this many amps. 0 = no buffer (default).",
+            "dynamic_current_decrease_bypass": "When enabled, lowering the current is applied immediately, bypassing the interval and buffer above. Recommended without a home battery, to avoid importing from the grid. Disable to throttle increases and decreases equally.",
             "ev_soc_entity": "Sensor that reports the EV battery state of charge.",
             "ev_connected_entity": "Binary sensor that indicates whether the EV is connected.",
-            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)"
+            "ev_charging_entity": "Optional. Sensor that reports whether the EV is actively charging (e.g. sensor.tesla_charging with state 'charging'). Prevents unnecessary API calls when the car is connected but not drawing power.",
+            "ev_home_entity": "Optional. When the car is not at home per this entity (e.g. device_tracker.tesla_location), PV won't control it — prevents managing a charge away from home.",
+            "ev_target_soc": "Stop charging when EV reaches this state of charge (%)",
+            "ev_follow_target_soc": "When enabled, read the EV target SoC live from the entity below (e.g. the car's own charge-limit number) instead of the slider above. The slider is used as a fallback when the entity is unavailable.",
+            "ev_target_soc_entity": "Number entity whose value is the EV target SoC to follow (e.g. number.tesla_charge_limit)."
           }
         },
         "reconfigure_constraints": {
@@ -303,6 +337,7 @@
           "description": "Update runtime constraints, grid supplementation, and big consumer settings.",
           "data": {
             "switch_interval": "Minimum Switch Interval (s)",
+            "restart_interval": "Restart Interval (s)",
             "averaging_window": "Averaging Window (s)",
             "on_only": "On Only (never turn off)",
             "protect_from_preemption": "Protect From Preemption",
@@ -314,6 +349,7 @@
             "schedule_deadline": "Schedule Deadline",
             "start_after": "Start After",
             "end_before": "End Before",
+            "min_battery_soc_start": "Min Battery SoC to Start (%)",
             "allow_grid_supplement": "Allow Grid Supplementation",
             "max_grid_power": "Maximum Grid Power (W)",
             "cheap_price_threshold": "Cheap Price Threshold",
@@ -324,6 +360,7 @@
           },
           "data_description": {
             "switch_interval": "Minimum time between switching this appliance on and off.",
+            "restart_interval": "Minimum time to wait before this appliance can be switched back on after being turned off. Leave empty to use the Switch Interval.",
             "averaging_window": "Custom averaging window for excess power calculation. Shorter windows respond faster but may cause more switching. Leave empty to use the global default (1800 seconds / 30 minutes).",
             "on_only": "If enabled, this appliance will only be turned on, never automatically turned off.",
             "protect_from_preemption": "When enabled, this appliance will never be shed to make room for a higher-priority appliance.",
@@ -335,6 +372,7 @@
             "schedule_deadline": "Time by which the minimum daily runtime must be completed.",
             "start_after": "Earliest time this appliance may operate. Leave empty for no restriction.",
             "end_before": "Latest time this appliance may operate. Leave empty for no restriction.",
+            "min_battery_soc_start": "Don't start this appliance until the home battery has at least this charge level. Empty = disabled. Only blocks starting — a running appliance is not stopped.",
             "allow_grid_supplement": "Allow using grid power when the energy price is cheap. The price threshold can be configured below, or falls back to the global cheap price threshold.",
             "max_grid_power": "Maximum watts to draw from the grid during cheap-tariff supplementation.",
             "cheap_price_threshold": "Price threshold below which grid supplementation is allowed for this appliance. Leave empty to use the global threshold.",
@@ -355,6 +393,7 @@
         "missing_max_grid_power": "Maximum grid power is required when grid supplementation is enabled.",
         "suggest_big_consumer": "This appliance draws 3000W or more. Consider enabling 'Big Consumer' to prevent battery discharge when active. Submit again to keep current setting.",
         "cheap_grid_target_current_requires_dynamic": "Cheap-window target current is only available for dynamic-current appliances. Enable dynamic_current or leave this field empty.",
+        "missing_target_soc_entity": "Select a target SoC entity to follow, or disable 'Follow target SoC from entity'.",
         "circular_dependency": "Circular dependency: the selected appliance already depends on this one.",
         "helper_only_with_requires": "An appliance cannot be both a helper and have its own dependency. Either clear 'Requires Appliance' or uncheck 'Run Only as Helper'."
       },
@@ -449,6 +488,7 @@
           "battery_max_discharge_entity": "Battery Max Discharge Entity",
           "battery_max_discharge_default": "Default Max Discharge Power (W)",
           "min_battery_soc": "Minimum Battery SoC (%)",
+          "min_battery_soc_hysteresis": "Battery SoC Re-enable Hysteresis (%)",
           "auto_battery_grid_charge": "Automatically force-charge battery during cheap tariff windows",
           "battery_grid_charge_power_w": "Forced grid-charge power (W)",
           "grid_charge_engage_min_duration_minutes": "Minimum engage duration (min)",
@@ -468,6 +508,7 @@
           "battery_max_discharge_entity": "Entity to control maximum battery discharge power.",
           "battery_max_discharge_default": "Default maximum discharge power when no override is active.",
           "min_battery_soc": "When battery SoC drops below this threshold, all non-essential appliances are shed and battery discharge is blocked. Leave empty to disable.",
+          "min_battery_soc_hysteresis": "Once SoC protection trips, the battery must climb this many points above the minimum before appliances are re-allowed. Prevents big consumers (e.g. EV chargers) flapping on/off at the threshold. 0 = no hysteresis.",
           "auto_battery_grid_charge": "When enabled, the coordinator will automatically engage force-charge mode during cheap tariff windows.",
           "battery_grid_charge_power_w": "Target charging power in Watts when force-charging from the grid.",
           "grid_charge_engage_min_duration_minutes": "Minimum number of minutes the cheap window must last before engaging force-charge.",

@@ -5,6 +5,27 @@ import logging
 
 _LOGGER = logging.getLogger(__name__)
 
+# States that mean the EV is actively drawing power. The Tesla integration
+# uses "charging"; other integrations may use "Charging" or "charging_now".
+_CHARGING_STATES = frozenset({"charging", "charging_now"})
+_UNAVAILABLE_STATES = frozenset({"unavailable", "unknown", "none", ""})
+
+
+def parse_ev_charging(hass, entity_id: str | None) -> bool | None:
+    """Read an EV charging-state sensor (e.g. sensor.tesla_charging).
+
+    Returns True when the state string indicates active charging, False
+    when it indicates any non-charging state (complete, stopped,
+    disconnected, idle), and None when the sensor is unavailable or
+    the entity is not configured.
+    """
+    if entity_id is None:
+        return None
+    state = hass.states.get(entity_id)
+    if state is None or state.state in _UNAVAILABLE_STATES:
+        return None
+    return state.state.lower() in _CHARGING_STATES
+
 
 class SensorCombiner:
     """Combines multiple sensor values into one."""

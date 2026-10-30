@@ -15,7 +15,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from .const import Action
+from .const import (
+    DEFAULT_NOT_DRAWING_THRESHOLD_W,
+    NOT_DRAWING_GRACE_SECONDS,
+    Action,
+)
 from .models import (
     ApplianceConfig,
     ApplianceState,
@@ -44,6 +48,15 @@ class FormattedStatus:
     plan_action: str | None
     plan_window_start: datetime | None
     plan_window_end: datetime | None
+    # True when the appliance is commanded on and HA reports it ON, but the
+    # measured draw is ~0 — i.e. the device is not confirmed actually running.
+    not_drawing_power: bool = False
+    # True when a dynamic-current change is being held back by the throttle
+    # (dynamic_current_interval / min_delta): the optimizer computed a new
+    # target this cycle but it has NOT been written to the device. The status
+    # text then reports the held (applied) current, not the unapplied target.
+    current_deferred: bool = False
+    current_deferred_seconds: int | None = None
 
 
 def format_duration(seconds: float) -> str:
@@ -85,9 +98,12 @@ def format_status(
     config: ApplianceConfig,
     *,
     switch_interval: int,
+    restart_interval: int | None = None,
     battery_action: BatteryDischargeAction,
     plan: Plan | None,
     now: datetime,
+    applied_current: float | None = None,
+    current_change_ts: datetime | None = None,
 ) -> FormattedStatus:
     """Compose the final state string and attributes for an appliance.
 
@@ -102,9 +118,19 @@ def format_status(
     # before truncating the base reason.
     suffixes: list[str] = []
 
+    # --- Dynamic-current hold: when the throttle (dynamic_current_interval /
+    # min_delta) is suppressing a SET_CURRENT, the optimizer's per-cycle target
+    # has NOT been written. Report the *applied* current instead so the status
+    # doesn't claim a value the charger never received. ---
+    current_deferred, current_deferred_seconds, held_reason = _compute_current_hold(
+        decision, state, applied_current, current_change_ts,
+        config.dynamic_current_interval, now,
+    )
+    base_reason = held_reason if held_reason is not None else decision.reason
+
     # --- S1: switch cooldown suffix ---
     cooldown_remaining, switch_deferred = _compute_cooldown(
-        decision, state, switch_interval, now
+        decision, state, switch_interval, now, restart_interval
     )
     if switch_deferred:
         suffixes.append(
@@ -118,6 +144,11 @@ def format_status(
             f" [battery discharge limited to "
             f"{battery_action.max_discharge_watts:.0f}W]"
         )
+
+    # --- S5: commanded-on-but-not-drawing suffix ---
+    not_drawing_power = _is_not_drawing(decision, state, config, now)
+    if not_drawing_power:
+        suffixes.append(" [on but 0W — device not confirmed running]")
 
     # --- S4: plan deviation suffix ---
     plan_action: str | None = None
@@ -158,7 +189,7 @@ def format_status(
         # the optimizer's overrides_plan flag in this case because there is
         # no functional deviation to surface.
 
-    text = _compose_with_truncation(decision.reason, suffixes)
+    text = _compose_with_truncation(base_reason, suffixes)
 
     return FormattedStatus(
         text=text,
@@ -170,7 +201,47 @@ def format_status(
         plan_action=plan_action,
         plan_window_start=plan_window_start,
         plan_window_end=plan_window_end,
+        not_drawing_power=not_drawing_power,
+        current_deferred=current_deferred,
+        current_deferred_seconds=current_deferred_seconds,
     )
+
+
+def _is_not_drawing(
+    decision: ControlDecision,
+    state: ApplianceState,
+    config: ApplianceConfig,
+    now: datetime,
+) -> bool:
+    """Return True when the appliance is commanded on and HA reports it ON,
+    but the measured power draw is ~0 — the device is not confirmed running.
+
+    Guards against false positives:
+    - Only when a real power measurement exists (``actual_power_entity``);
+      otherwise ``current_power`` is an estimate and would never read ~0.
+    - Only while commanded ON/SET_CURRENT and physically reported on.
+    - Suppressed for ``NOT_DRAWING_GRACE_SECONDS`` after the last state
+      change so the device's normal ramp-up isn't flagged.
+    """
+    if decision.action not in (Action.ON, Action.SET_CURRENT):
+        return False
+    if not state.is_on:
+        return False
+    if config.actual_power_entity is None:
+        return False
+
+    # Grace period after the most recent on/off transition.
+    if state.last_state_change is not None:
+        elapsed = (now - state.last_state_change).total_seconds()
+        if elapsed < NOT_DRAWING_GRACE_SECONDS:
+            return False
+
+    threshold = (
+        config.completion_power_threshold
+        if config.completion_power_threshold is not None
+        else DEFAULT_NOT_DRAWING_THRESHOLD_W
+    )
+    return state.current_power < threshold
 
 
 def _compose_with_truncation(reason: str, suffixes: list[str]) -> str:
@@ -210,28 +281,86 @@ def _compute_cooldown(
     state: ApplianceState,
     switch_interval: int,
     now: datetime,
+    restart_interval: int | None = None,
 ) -> tuple[int, bool]:
     """Return (seconds_remaining, switch_deferred) for the cooldown decoration.
 
-    A decision "would switch" when it flips the on/off state. SET_CURRENT
-    and IDLE never count as switches. Safety-OFF decisions bypass the
-    cooldown entirely via the `bypasses_cooldown` flag.
+    A decision "would switch" when it flips the on/off state. SET_CURRENT on
+    an already-ON appliance and IDLE never count as switches, but SET_CURRENT
+    against a physically-OFF appliance is a re-enable (the apply phase turns
+    it on and that write is switch-interval gated too). Safety-OFF decisions
+    bypass the cooldown entirely via the `bypasses_cooldown` flag.
+
+    Direction-aware: a re-enable (OFF -> ON) is gated by `restart_interval`
+    (falling back to `switch_interval` when unset); a shed (ON -> OFF) is
+    always gated by `switch_interval`.
     """
     if decision.bypasses_cooldown:
         return (0, False)
     if state.last_state_change is None:
         return (0, False)
 
-    would_switch_on = decision.action == Action.ON and not state.is_on
+    would_switch_on = (
+        decision.action in (Action.ON, Action.SET_CURRENT) and not state.is_on
+    )
     would_switch_off = decision.action == Action.OFF and state.is_on
     if not (would_switch_on or would_switch_off):
         return (0, False)
 
     elapsed = (now - state.last_state_change).total_seconds()
-    remaining = int(switch_interval - elapsed)
+    interval = switch_interval
+    if would_switch_on and restart_interval is not None:
+        interval = restart_interval
+    remaining = int(interval - elapsed)
     if remaining <= 0:
         return (0, False)
     return (remaining, True)
+
+
+def _compute_current_hold(
+    decision: ControlDecision,
+    state: ApplianceState,
+    applied_current: float | None,
+    current_change_ts: datetime | None,
+    dynamic_current_interval: int,
+    now: datetime,
+) -> tuple[bool, int | None, str | None]:
+    """Detect a throttled (held) dynamic-current change for the status string.
+
+    Returns ``(deferred, seconds_remaining, held_reason)``.
+
+    The coordinator updates the applied current immediately after a successful
+    SET_CURRENT write. So when a running dynamic-current appliance has a
+    SET_CURRENT decision whose ``target_current`` differs from the value
+    actually applied, it means the write was suppressed this cycle by the
+    throttle (``dynamic_current_interval`` / ``dynamic_current_min_delta`` /
+    decrease-bypass) — the optimizer's per-cycle target is not on the device.
+
+    In that case we report the *held* current (and, if the interval is the
+    gate, the time until the next allowed change) instead of the unapplied
+    target. When nothing is held, returns ``(False, None, None)`` and the
+    caller keeps ``decision.reason``.
+    """
+    if decision.action != Action.SET_CURRENT or not state.is_on:
+        return (False, None, None)
+    if applied_current is None or decision.target_current is None:
+        return (False, None, None)
+    if decision.target_current == applied_current:
+        return (False, None, None)
+
+    remaining: int | None = None
+    if dynamic_current_interval > 0 and current_change_ts is not None:
+        rem = int(dynamic_current_interval - (now - current_change_ts).total_seconds())
+        if rem > 0:
+            remaining = rem
+
+    held = (
+        f"Holding {applied_current:.1f}A - target "
+        f"{decision.target_current:.1f}A deferred"
+    )
+    if remaining is not None:
+        held += f" ({format_duration(remaining)})"
+    return (True, remaining, held)
 
 
 def _should_show_battery_limit(

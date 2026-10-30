@@ -20,6 +20,7 @@ from .const import (
     CONF_LOAD_POWER,
     CONF_PV_POWER,
 )
+from .helpers import parse_ev_charging
 from .models import (
     Action,
     ApplianceConfig,
@@ -115,6 +116,16 @@ class Controller:
             return None
         return state.state == "on"
 
+    def _read_ev_charging(self, entity_id: str | None) -> bool | None:
+        """Read an EV charging-state sensor (e.g. sensor.tesla_charging).
+
+        Returns True when the state indicates active charging, False
+        for any other state, None when unavailable or unconfigured.
+        Delegates to the shared helper so coordinator and controller
+        can never drift apart on what counts as "charging".
+        """
+        return parse_ev_charging(self.hass, entity_id)
+
     # ------------------------------------------------------------------
     # Power state collection
     # ------------------------------------------------------------------
@@ -199,6 +210,11 @@ class Controller:
             if config.ev_connected_entity:
                 ev_connected = self._read_binary(config.ev_connected_entity)
 
+            # EV charging status (e.g. sensor.tesla_charging)
+            ev_charging: bool | None = None
+            if config.ev_charging_entity:
+                ev_charging = self._read_ev_charging(config.ev_charging_entity)
+
             # Runtime from tracker
             runtime_today = runtime_tracker.get(config.id, timedelta())
 
@@ -211,6 +227,7 @@ class Controller:
                 energy_today=0.0,
                 last_state_change=None,
                 ev_connected=ev_connected,
+                ev_charging=ev_charging,
             )
             states.append(state)
 

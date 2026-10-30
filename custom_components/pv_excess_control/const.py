@@ -16,6 +16,18 @@ DEFAULT_ON_THRESHOLD = 200  # W excess before turning ON
 DEFAULT_OFF_THRESHOLD = -50  # W excess before turning OFF
 DEFAULT_DYNAMIC_ON_THRESHOLD = 50  # W buffer before starting dynamic current appliance
 
+# "Not drawing" detection (also the EV-charging fallback): grace period after a
+# state change before an ON appliance is expected to draw, and the power
+# threshold (W) below which it counts as "not actually running". Used by both
+# status_formatter._is_not_drawing and the optimizer's _ev_is_charging fallback.
+NOT_DRAWING_GRACE_SECONDS = 90
+DEFAULT_NOT_DRAWING_THRESHOLD_W = 50.0
+# A Phase 3 SHED turn-off bypasses the appliance switch_interval cooldown when the
+# AVERAGED excess is below -SHED_COOLDOWN_BYPASS_IMPORT_W (i.e. sustained grid import).
+# Stops a grid-importing charge promptly without trading away flap protection. Using the
+# averaged excess (not instantaneous) means a transient cloud dip does not trigger it.
+SHED_COOLDOWN_BYPASS_IMPORT_W = 200.0  # W of sustained import before a shed-OFF acts immediately
+
 # Limits
 MIN_PRIORITY = 1
 MAX_PRIORITY = 1000
@@ -138,6 +150,13 @@ CONF_ALLOW_GRID_CHARGING = "allow_grid_charging"
 CONF_BATTERY_MAX_DISCHARGE_ENTITY = "battery_max_discharge_entity"
 CONF_BATTERY_MAX_DISCHARGE_DEFAULT = "battery_max_discharge_default"
 CONF_MIN_BATTERY_SOC = "min_battery_soc"
+# Re-enable hysteresis band (percentage points) for battery SoC protection.
+# Once SoC protection sheds appliances at `min_battery_soc`, the battery must
+# climb back to `min_battery_soc + hysteresis` before they are re-allowed.
+# Prevents oscillation that whiplashes big consumers (e.g. EV chargers) on/off
+# around the threshold. 0 = no hysteresis (legacy single-threshold behaviour).
+CONF_MIN_BATTERY_SOC_HYSTERESIS = "min_battery_soc_hysteresis"
+DEFAULT_MIN_BATTERY_SOC_HYSTERESIS = 0.0
 
 # Inverter forced grid-charge (auto + manual)
 CONF_AUTO_BATTERY_GRID_CHARGE = "auto_battery_grid_charge"
@@ -173,6 +192,8 @@ CONF_MIN_CURRENT = "min_current"
 CONF_MAX_CURRENT = "max_current"
 CONF_EV_SOC_ENTITY = "ev_soc_entity"
 CONF_EV_CONNECTED_ENTITY = "ev_connected_entity"
+CONF_EV_CHARGING_ENTITY = "ev_charging_entity"
+CONF_EV_HOME_ENTITY = "ev_home_entity"
 CONF_IS_BIG_CONSUMER = "is_big_consumer"
 CONF_BATTERY_DISCHARGE_OVERRIDE = "battery_discharge_override"
 CONF_ON_ONLY = "on_only"
@@ -182,15 +203,19 @@ CONF_MAX_DAILY_ACTIVATIONS = "max_daily_activations"
 CONF_SCHEDULE_DEADLINE = "schedule_deadline"
 CONF_START_AFTER = "start_after"
 CONF_END_BEFORE = "end_before"
+CONF_MIN_BATTERY_SOC_START = "min_battery_soc_start"
 CONF_NOTIFY_APPLIANCE_ON = "notify_appliance_on"
 CONF_NOTIFY_APPLIANCE_OFF = "notify_appliance_off"
 CONF_NOTIFY_DAILY_SUMMARY = "notify_daily_summary"
 CONF_SWITCH_INTERVAL = "switch_interval"
+CONF_RESTART_INTERVAL = "restart_interval"
 CONF_AVERAGING_WINDOW = "averaging_window"
 CONF_REQUIRES_APPLIANCE = "requires_appliance"
 CONF_HELPER_ONLY = "helper_only"
 CONF_PLAN_INFLUENCE = "plan_influence"
 CONF_EV_TARGET_SOC = "ev_target_soc"
+CONF_EV_FOLLOW_TARGET_SOC = "ev_follow_target_soc"
+CONF_EV_TARGET_SOC_ENTITY = "ev_target_soc_entity"
 CONF_ALLOW_GRID_SUPPLEMENT = "allow_grid_supplement"
 CONF_MAX_GRID_POWER = "max_grid_power"
 CONF_CHEAP_GRID_TARGET_CURRENT = "cheap_grid_target_current"
@@ -199,3 +224,23 @@ CONF_CURRENT_STEP = "current_step"
 CONF_ON_THRESHOLD = "on_threshold"
 CONF_COMPLETION_POWER_THRESHOLD = "completion_power_threshold"
 CONF_OFF_THRESHOLD = "off_threshold"
+
+# Dynamic-current write throttling (per appliance). Limits how often the
+# charging current is rewritten, to avoid burning through EV-charger API
+# command quotas (e.g. Tesla/TeslaFi). All default to current behaviour.
+CONF_DYNAMIC_CURRENT_INTERVAL = "dynamic_current_interval"
+CONF_DYNAMIC_CURRENT_MIN_DELTA = "dynamic_current_min_delta"
+CONF_DYNAMIC_CURRENT_DECREASE_BYPASS = "dynamic_current_decrease_bypass"
+DEFAULT_DYNAMIC_CURRENT_INTERVAL = 0  # seconds; 0 = no time throttle (write every cycle)
+DEFAULT_DYNAMIC_CURRENT_MIN_DELTA = 0.0  # amps; 0 = no delta buffer
+DEFAULT_DYNAMIC_CURRENT_DECREASE_BYPASS = True  # let current reductions bypass the throttle
+
+# Grid import cap and PV drop detection (safety brake for EV charging)
+CONF_GRID_IMPORT_CAP_W = "grid_import_cap_w"
+CONF_PV_DROP_THRESHOLD_W = "pv_drop_threshold_w"
+DEFAULT_GRID_IMPORT_CAP_W = 5000  # watts; reduce EV current if grid import exceeds this
+DEFAULT_PV_DROP_THRESHOLD_W = 2000  # watts; reduce EV current if PV drops by this amount
+# Number of consecutive samples the PV drop must persist before the safety brake
+# fires. Filters transient cloud dips so the brake doesn't slam dynamic-current
+# appliances to minimum on a single-sample blip.
+SAFETY_BRAKE_PV_DROP_MIN_SAMPLES = 2

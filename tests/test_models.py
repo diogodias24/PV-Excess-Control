@@ -62,6 +62,26 @@ def _make_appliance_config(**kwargs) -> ApplianceConfig:
     return ApplianceConfig(**defaults)
 
 
+class TestDynamicCurrentThrottleFields:
+    """Per-appliance dynamic-current throttle config (issue #41)."""
+
+    def test_defaults_preserve_legacy_behaviour(self):
+        cfg = _make_appliance_config()
+        assert cfg.dynamic_current_interval == 0
+        assert cfg.dynamic_current_min_delta == 0.0
+        assert cfg.dynamic_current_decrease_bypass is True
+
+    def test_custom_values(self):
+        cfg = _make_appliance_config(
+            dynamic_current_interval=300,
+            dynamic_current_min_delta=1.5,
+            dynamic_current_decrease_bypass=False,
+        )
+        assert cfg.dynamic_current_interval == 300
+        assert cfg.dynamic_current_min_delta == 1.5
+        assert cfg.dynamic_current_decrease_bypass is False
+
+
 # ---------------------------------------------------------------------------
 # TestPowerState
 # ---------------------------------------------------------------------------
@@ -164,6 +184,7 @@ class TestApplianceConfig:
         assert cfg.max_daily_runtime is None
         assert cfg.schedule_deadline is None
         assert cfg.switch_interval == 300
+        assert cfg.restart_interval is None
         assert cfg.allow_grid_supplement is False
         assert cfg.max_grid_power is None
         # defaults for mutable runtime state
@@ -194,6 +215,7 @@ class TestApplianceConfig:
             max_daily_runtime=timedelta(hours=8),
             schedule_deadline=deadline,
             switch_interval=60,
+            restart_interval=120,
             allow_grid_supplement=True,
             max_grid_power=3000.0,
             override_active=True,
@@ -213,6 +235,7 @@ class TestApplianceConfig:
         assert cfg.max_daily_runtime == timedelta(hours=8)
         assert cfg.schedule_deadline == deadline
         assert cfg.switch_interval == 60
+        assert cfg.restart_interval == 120
         assert cfg.allow_grid_supplement is True
         assert cfg.max_grid_power == 3000.0
         assert cfg.override_active is True

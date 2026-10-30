@@ -1,6 +1,7 @@
 """Tests for PV Excess Control optimizer - Phases 1 (ASSESS) & 2 (ALLOCATE)."""
 from __future__ import annotations
 
+import datetime as dt_module
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -70,6 +71,9 @@ def _make_appliance(
     current_entity: str | None = None,
     on_only: bool = False,
     ev_connected_entity: str | None = None,
+    ev_charging_entity: str | None = None,
+    ev_home_entity: str | None = None,
+    actual_power_entity: str | None = None,
     is_big_consumer: bool = False,
     battery_max_discharge_override: float | None = None,
     min_daily_runtime: timedelta | None = None,
@@ -86,6 +90,7 @@ def _make_appliance(
     cheap_price_threshold: float | None = None,
     completion_power_threshold: float | None = None,
     cheap_grid_target_current: float | None = None,
+    min_battery_soc_start: float | None = None,
 ) -> ApplianceConfig:
     return ApplianceConfig(
         id=id,
@@ -94,13 +99,15 @@ def _make_appliance(
         priority=priority,
         phases=phases,
         nominal_power=nominal_power,
-        actual_power_entity=None,
+        actual_power_entity=actual_power_entity,
         dynamic_current=dynamic_current,
         current_entity=current_entity,
         min_current=min_current,
         max_current=max_current,
         ev_soc_entity=None,
         ev_connected_entity=ev_connected_entity,
+        ev_home_entity=ev_home_entity,
+        ev_charging_entity=ev_charging_entity,
         is_big_consumer=is_big_consumer,
         battery_max_discharge_override=battery_max_discharge_override,
         on_only=on_only,
@@ -120,6 +127,7 @@ def _make_appliance(
         cheap_price_threshold=cheap_price_threshold,
         completion_power_threshold=completion_power_threshold,
         cheap_grid_target_current=cheap_grid_target_current,
+        min_battery_soc_start=min_battery_soc_start,
     )
 
 
@@ -129,6 +137,8 @@ def _make_state(
     current_power: float = 0.0,
     runtime_today: timedelta | None = None,
     ev_connected: bool | None = None,
+    ev_at_home: bool | None = None,
+    ev_charging: bool | None = None,
     last_state_change: datetime | None = None,
     activations_today: int = 0,
 ) -> ApplianceState:
@@ -141,6 +151,8 @@ def _make_state(
         energy_today=0.0,
         last_state_change=last_state_change,
         ev_connected=ev_connected,
+        ev_at_home=ev_at_home,
+        ev_charging=ev_charging,
         activations_today=activations_today,
     )
 
@@ -284,6 +296,94 @@ class TestOptimizerAllocate:
         assert decision.action == Action.IDLE
         assert "disconnected" in decision.reason.lower()
 
+    def test_ev_away_turned_off(self):
+        """Home gate set + ev_at_home=False while ON -> OFF, bypasses cooldown."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            id="ev_charger",
+            ev_home_entity="device_tracker.tesla_location",
+            nominal_power=7000.0,
+        )
+        state = _make_state(id="ev_charger", is_on=True, ev_at_home=False)
+        power = _make_power(excess=8000.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance], appliance_states=[state],
+            plan=_empty_plan(), power_history=[power], tariff=_make_tariff(),
+        )
+
+        decision = result.decisions[0]
+        assert decision.action == Action.OFF
+        assert decision.bypasses_cooldown is True
+        assert "home" in decision.reason.lower()
+
+    def test_ev_away_skipped_when_off(self):
+        """Home gate set + ev_at_home=False while OFF -> IDLE (never a shed candidate)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            id="ev_charger", ev_home_entity="device_tracker.tesla_location",
+            nominal_power=7000.0,
+        )
+        state = _make_state(id="ev_charger", is_on=False, ev_at_home=False)
+        power = _make_power(excess=8000.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance], appliance_states=[state],
+            plan=_empty_plan(), power_history=[power], tariff=_make_tariff(),
+        )
+        assert result.decisions[0].action == Action.IDLE
+
+    def test_ev_at_home_allocates_normally(self):
+        """Home gate set + ev_at_home=True -> normal allocation (ON with excess)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            id="ev_charger", ev_home_entity="device_tracker.tesla_location",
+            nominal_power=7000.0,
+        )
+        state = _make_state(id="ev_charger", is_on=False, ev_at_home=True)
+        power = _make_power(excess=8000.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance], appliance_states=[state],
+            plan=_empty_plan(), power_history=[power], tariff=_make_tariff(),
+        )
+        assert result.decisions[0].action == Action.ON
+
+    def test_ev_home_unknown_keeps_existing_charge(self):
+        """Home gate set + ev_at_home=None (tracker unavailable) while ON ->
+        the charge is NOT interrupted (no fails-closed OFF)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            id="ev_charger", ev_home_entity="device_tracker.tesla_location",
+            nominal_power=7000.0,
+        )
+        state = _make_state(id="ev_charger", is_on=True, ev_at_home=None)
+        power = _make_power(excess=8000.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance], appliance_states=[state],
+            plan=_empty_plan(), power_history=[power], tariff=_make_tariff(),
+        )
+        assert result.decisions[0].action != Action.OFF
+
+    def test_ev_home_unknown_never_starts_charge(self):
+        """Home gate set + ev_at_home=None while OFF -> IDLE, never driven ON."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            id="ev_charger", ev_home_entity="device_tracker.tesla_location",
+            nominal_power=7000.0,
+        )
+        state = _make_state(id="ev_charger", is_on=False, ev_at_home=None)
+        power = _make_power(excess=8000.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance], appliance_states=[state],
+            plan=_empty_plan(), power_history=[power], tariff=_make_tariff(),
+        )
+        decision = result.decisions[0]
+        assert decision.action == Action.IDLE
+        assert "location unknown" in decision.reason
+
     def test_manual_override_forces_on(self):
         """override_active=True, 0W excess -> ON with 'override' in reason."""
         optimizer = _optimizer_for_tests()
@@ -305,6 +405,43 @@ class TestOptimizerAllocate:
         assert decision.appliance_id == "app_1"
         assert decision.action == Action.ON
         assert "override" in decision.reason.lower()
+
+    def test_manual_override_on_sets_bypasses_cooldown(self):
+        """A plain ON override must bypass the switch-interval cooldown so the
+        appliance turns on immediately when the override switch is toggled."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(override_active=True, nominal_power=2000.0)
+        result = optimizer.optimize(
+            power_state=_make_power(excess=0.0),
+            appliances=[appliance],
+            appliance_states=[_make_state()],
+            plan=_empty_plan(),
+            power_history=[_make_power(excess=0.0)],
+            tariff=_make_tariff(),
+        )
+        assert result.decisions[0].bypasses_cooldown is True
+
+    def test_manual_override_dynamic_current_sets_bypasses_cooldown(self):
+        """A dynamic-current override (set to max) must bypass cooldown so the
+        jump to max current isn't held back by the issue-41 throttle."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            override_active=True, dynamic_current=True,
+            current_entity="number.app_1_current",
+            min_current=6.0, max_current=16.0, nominal_power=2000.0,
+        )
+        result = optimizer.optimize(
+            power_state=_make_power(excess=0.0),
+            appliances=[appliance],
+            appliance_states=[_make_state()],
+            plan=_empty_plan(),
+            power_history=[_make_power(excess=0.0)],
+            tariff=_make_tariff(),
+        )
+        decision = result.decisions[0]
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current == 16.0
+        assert decision.bypasses_cooldown is True
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1515,115 @@ class TestOptimizerDependencies:
         assert decisions["heater"].action == Action.IDLE
         assert "dependency" in decisions["heater"].reason.lower()
 
+    def test_dependent_off_when_dependency_stops(self):
+        """Dependent forced OFF when its dependency is decided OFF this cycle."""
+        pump = _make_appliance(id="pump", name="Pool Pump", priority=10, nominal_power=1000.0,
+                               max_daily_runtime=timedelta(hours=1))
+        heater = _make_appliance(id="heater", name="Heat Pump", priority=3, nominal_power=1500.0,
+                                 requires_appliance="pump")
+        decisions = self._run(
+            [pump, heater],
+            [_make_state(id="pump", is_on=True, runtime_today=timedelta(hours=2)),
+             _make_state(id="heater", is_on=True, current_power=1500.0)],
+            excess=2700)
+        assert decisions["pump"].action == Action.OFF
+        assert decisions["heater"].action == Action.OFF
+        assert "no-flow" in decisions["heater"].reason
+        assert decisions["heater"].bypasses_cooldown is True
+
+    def test_dependent_stays_on_when_dependency_on(self):
+        """Dependent not disturbed when its dependency is running."""
+        pump = _make_appliance(id="pump", name="Pool Pump", priority=10, nominal_power=1000.0)
+        heater = _make_appliance(id="heater", name="Heat Pump", priority=3, nominal_power=1500.0,
+                                 requires_appliance="pump")
+        decisions = self._run(
+            [pump, heater],
+            [_make_state(id="pump", is_on=True, current_power=1000.0),
+             _make_state(id="heater", is_on=True, current_power=1500.0)],
+            excess=2700)
+        assert decisions["pump"].action in (Action.ON, Action.SET_CURRENT)
+        assert decisions["heater"].action in (Action.ON, Action.SET_CURRENT)
+
+    def test_dependency_chain_resolves(self):
+        """A requires B requires C: when C stops, B and A are both forced off."""
+        a = _make_appliance(id="a", name="App A", priority=5, nominal_power=1000.0,
+                            requires_appliance="b")
+        b = _make_appliance(id="b", name="App B", priority=5, nominal_power=1000.0,
+                            requires_appliance="c")
+        c = _make_appliance(id="c", name="App C", priority=5, nominal_power=1000.0,
+                            max_daily_runtime=timedelta(hours=1))
+        decisions = self._run(
+            [a, b, c],
+            [_make_state(id="a", is_on=True, current_power=1000.0),
+             _make_state(id="b", is_on=True, current_power=1000.0),
+             _make_state(id="c", is_on=True, current_power=1000.0,
+                         runtime_today=timedelta(hours=2))],
+            excess=3200)
+        assert decisions["c"].action == Action.OFF
+        assert decisions["b"].action == Action.OFF
+        assert decisions["a"].action == Action.OFF
+
+    def test_overridden_dependent_not_forced_off(self):
+        """Manual override on the dependent wins over no-flow protection."""
+        pump = _make_appliance(id="pump", name="Pool Pump", priority=10, nominal_power=1000.0,
+                               max_daily_runtime=timedelta(hours=1))
+        heater = _make_appliance(id="heater", name="Heat Pump", priority=3, nominal_power=1500.0,
+                                 requires_appliance="pump", override_active=True)
+        decisions = self._run(
+            [pump, heater],
+            [_make_state(id="pump", is_on=True, runtime_today=timedelta(hours=2)),
+             _make_state(id="heater", is_on=True, current_power=1500.0)],
+            excess=2700)
+        assert decisions["pump"].action == Action.OFF
+        assert decisions["heater"].action == Action.ON
+
+    def test_safety_only_dependent_off_when_dependency_off(self):
+        """Safety-only path: big-consumer dependent forced off when dep is off."""
+        pump = _make_appliance(id="pump", name="Pool Pump", priority=10, nominal_power=1000.0,
+                               is_big_consumer=True)
+        heater = _make_appliance(id="heater", name="Heat Pump", priority=3, nominal_power=1500.0,
+                                 is_big_consumer=True, requires_appliance="pump")
+        history = [PowerState(pv_production=5000, grid_export=None, grid_import=None,
+                              load_power=5000, excess_power=None, battery_soc=None,
+                              battery_power=None, ev_soc=None, timestamp=_utcnow())]
+        opt = _optimizer_for_tests(grid_voltage=230)
+        result = opt.optimize(
+            power_state=history[0], appliances=[pump, heater],
+            appliance_states=[_make_state(id="pump"),
+                              _make_state(id="heater", is_on=True, current_power=1500.0)],
+            plan=Plan(created_at=_utcnow(), horizon=timedelta(hours=24), entries=[],
+                      battery_target=BatteryTarget(target_soc=100, target_time=_utcnow(),
+                                                   strategy=BatteryStrategy.BALANCED),
+                      confidence=0.5),
+            power_history=history,
+            tariff=TariffInfo(current_price=0.30, feed_in_tariff=0.08,
+                              cheap_price_threshold=0.10, battery_charge_price_threshold=0.05),
+        )
+        decisions = {d.appliance_id: d for d in result.decisions}
+        assert decisions["heater"].action == Action.OFF
+        assert "no-flow" in decisions["heater"].reason
+        assert decisions["heater"].bypasses_cooldown is True
+
+    def test_missing_dependency_state_does_not_force_off(self):
+        """A transient state-collection miss on the dependency must NOT
+        tear down a physically-running dependent in the same cycle.
+
+        The no-flow pass fires on (a) an explicit OFF decision for the
+        dependency or (b) the dependency being physically off. A missing
+        state (sensor unavailable / not yet collected) is neither — the
+        dependent must keep running until the dependency's absence is
+        confirmed as a decision or a physical state.
+        """
+        pump = _make_appliance(id="pump", name="Pool Pump", priority=10, nominal_power=1000.0)
+        heater = _make_appliance(id="heater", name="Heat Pump", priority=3, nominal_power=1500.0,
+                                 requires_appliance="pump")
+        decisions = self._run(
+            [pump, heater],
+            # NOTE: no state entry for the pump at all (transient miss)
+            [_make_state(id="heater", is_on=True, current_power=1500.0)],
+            excess=2700)
+        assert decisions["heater"].action in (Action.ON, Action.SET_CURRENT)
+
 
 # ---------------------------------------------------------------------------
 # TestOptimizerPreemption
@@ -2323,6 +2569,141 @@ class TestAlreadyOnReasonStrings:
         assert "current: +" in decision.reason or "current: -" in decision.reason
 
 
+class TestDynamicCurrentReasonStrings:
+    """Reason strings produced by the optimizer for the live status sensor.
+
+    Coverage for the two strings observed on the production instance during
+    the "why was the current reduced" investigation:
+      - "Dynamic current adjustment: X.XA (YW available)" for an already-ON
+        dynamic-current appliance with enough excess to bump.
+      - "Insufficient excess for min current (YW < ZW needed [..])" for an
+        OFF dynamic-current appliance without enough averaged excess.
+    """
+
+    def _base_kwargs(self, **overrides):
+        from datetime import timedelta as td
+
+        from custom_components.pv_excess_control.models import (
+            ApplianceConfig, ApplianceState, BatteryTarget, BatteryStrategy,
+            Plan, PowerState, TariffInfo,
+        )
+
+        appliance = ApplianceConfig(
+            id="app1", name="EV", entity_id="switch.ev",
+            priority=100, phases=3, nominal_power=11000.0,
+            actual_power_entity=None,
+            dynamic_current=True, current_entity="number.ev_current",
+            min_current=6.0, max_current=16.0,
+            ev_soc_entity=None, ev_connected_entity=None,
+            is_big_consumer=False, battery_max_discharge_override=None,
+            on_only=False,
+            min_daily_runtime=None, max_daily_runtime=None,
+            schedule_deadline=None,
+            switch_interval=300,
+            allow_grid_supplement=False, max_grid_power=None,
+            **overrides,
+        )
+        state = ApplianceState(
+            appliance_id="app1",
+            is_on=False,
+            current_power=0.0,
+            current_amperage=None,
+            runtime_today=td(0),
+            energy_today=1.0,
+            last_state_change=None,
+            ev_connected=None,
+        )
+        power_state = PowerState(
+            pv_production=2000, grid_export=0, grid_import=0,
+            load_power=0, excess_power=2000,
+            battery_soc=None, battery_power=None, ev_soc=None,
+            timestamp=datetime(2026, 4, 6, 12, 0, 0),
+        )
+        plan = Plan(
+            created_at=datetime(2026, 4, 6, 11, 0, 0),
+            horizon=td(hours=8), entries=[],
+            battery_target=BatteryTarget(
+                target_soc=80, target_time=datetime(2026, 4, 6, 18, 0, 0),
+                strategy=BatteryStrategy.BALANCED,
+            ),
+            confidence=0.75,
+        )
+        tariff = TariffInfo(
+            current_price=0.20, feed_in_tariff=0.08,
+            cheap_price_threshold=0.15, battery_charge_price_threshold=0.10,
+        )
+        return {
+            "appliance": appliance, "state": state,
+            "power_state": power_state, "plan": plan, "tariff": tariff,
+        }
+
+    def test_off_dynamic_insufficient_excess_mentions_min_current(self) -> None:
+        """OFF dynamic appliance, avg excess below min-current + buffer -> IDLE."""
+        from custom_components.pv_excess_control.models import Action
+        from custom_components.pv_excess_control.optimizer import Optimizer
+
+        kwargs = self._base_kwargs()
+        opt = _optimizer_for_tests()
+        result = opt.optimize(
+            power_state=kwargs["power_state"],
+            appliances=[kwargs["appliance"]],
+            appliance_states=[kwargs["state"]],
+            plan=kwargs["plan"],
+            power_history=[kwargs["power_state"]],
+            tariff=kwargs["tariff"],
+        )
+        decision = result.decisions[0]
+        assert decision.action == Action.IDLE
+        assert decision.reason == (
+            "Insufficient excess for min current "
+            "(2000W < 4190W needed [6.0A * 230V * 3 + 50W buffer])"
+        )
+
+    def test_already_on_dynamic_adjustment_shows_amps_and_available(self) -> None:
+        """ON dynamic appliance with enough excess -> SET_CURRENT with the
+        "Dynamic current adjustment: X.XA (YW available)" reason seen live."""
+        from datetime import timedelta as td
+
+        from custom_components.pv_excess_control.models import (
+            Action, ApplianceState, PowerState,
+        )
+        from custom_components.pv_excess_control.optimizer import Optimizer
+
+        kwargs = self._base_kwargs()
+        # Charging at 10A (6900W on 3 phases); 2760W excess available ->
+        # available = 2760 + 6900 = 9660W -> 14A target.
+        on_state = ApplianceState(
+            appliance_id="app1",
+            is_on=True,
+            current_power=6900.0,
+            current_amperage=10.0,
+            runtime_today=td(0),
+            energy_today=1.0,
+            last_state_change=None,
+            ev_connected=None,
+            ev_charging=True,
+        )
+        excess = PowerState(
+            pv_production=9660, grid_export=0, grid_import=0,
+            load_power=6900, excess_power=2760,
+            battery_soc=None, battery_power=None, ev_soc=None,
+            timestamp=datetime(2026, 4, 6, 12, 0, 0),
+        )
+        opt = _optimizer_for_tests()
+        result = opt.optimize(
+            power_state=excess,
+            appliances=[kwargs["appliance"]],
+            appliance_states=[on_state],
+            plan=kwargs["plan"],
+            power_history=[excess],
+            tariff=kwargs["tariff"],
+        )
+        decision = result.decisions[0]
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current == 14.0
+        assert decision.reason == "Dynamic current adjustment: 14.0A (9660W available)"
+
+
 class TestStayingOnHelpersDirect:
     """Direct unit tests for the _format_staying_on_* helpers.
 
@@ -2426,16 +2807,25 @@ class TestStayingOnHelpersDirect:
 class TestDeadlineReasonStrings:
     """Deadline strings at the two deadline must-run sites use human-readable durations.
 
-    The optimizer uses `datetime.now()` via a local import inside the
-    method, so we can't pin the exact minute count without refactoring.
-    Instead, we:
-    1. Use an oversized `min_daily_runtime` (25h) so that
-       `remaining_runtime * 1.1` is always >= any possible `time_until_deadline`,
-       which forces the deadline branch to fire regardless of wall time.
-    2. Assert on structural markers of the new format: the string must
-       start with "Deadline must-run:", contain "remaining, deadline HH:MM (in",
-       and must NOT contain the old "s remaining, deadline in" shape.
+    The optimizer reads wall-clock time through an injectable ``now_provider``;
+    these tests pin it to a fixed morning hour (13:00). That makes the 14:00
+    deadline deterministic: it always lands in the future ("in 1h"), never
+    "(tomorrow)", regardless of when the suite runs.
+
+    The fixture also uses an oversized `min_daily_runtime` (25h) so that
+    `remaining_runtime * 1.1` is always >= any possible `time_until_deadline`,
+    which forces the deadline branch to fire regardless of the frozen time.
+    We then assert on structural markers of the new format: the string must
+    start with "Deadline must-run:", contain "remaining, deadline HH:MM (in",
+    and must NOT contain the old "s remaining, deadline in" shape.
     """
+
+    @staticmethod
+    def _frozen_now(tz=None):
+        """Pin wall-clock 'now' to 13:00 so a 14:00 deadline is never 'tomorrow'."""
+        if tz is not None:
+            return dt_module.datetime(2026, 4, 6, 13, 0, 0, tzinfo=tz)
+        return dt_module.datetime(2026, 4, 6, 13, 0, 0, tzinfo=dt_module.timezone.utc)
 
     def _build_fixture(self, *, dynamic: bool) -> dict:
         from datetime import timedelta as td, time
@@ -2521,7 +2911,7 @@ class TestDeadlineReasonStrings:
         from custom_components.pv_excess_control.optimizer import Optimizer
 
         fx = self._build_fixture(dynamic=False)
-        opt = _optimizer_for_tests()
+        opt = _optimizer_for_tests(now_provider=self._frozen_now)
         result = opt.optimize(
             power_state=fx["power_state"],
             appliances=[fx["appliance"]],
@@ -2538,7 +2928,7 @@ class TestDeadlineReasonStrings:
         from custom_components.pv_excess_control.optimizer import Optimizer
 
         fx = self._build_fixture(dynamic=True)
-        opt = _optimizer_for_tests()
+        opt = _optimizer_for_tests(now_provider=self._frozen_now)
         result = opt.optimize(
             power_state=fx["power_state"],
             appliances=[fx["appliance"]],
@@ -2565,7 +2955,7 @@ class TestDeadlineReasonStrings:
         from dataclasses import replace
         midnight_appliance = replace(appliance, schedule_deadline=time(0, 0))
 
-        opt = _optimizer_for_tests()
+        opt = _optimizer_for_tests(now_provider=self._frozen_now)
         result = opt.optimize(
             power_state=fx["power_state"],
             appliances=[midnight_appliance],
@@ -4147,6 +4537,204 @@ class TestDynamicCurrentBumpClamp:
             assert abs(kona_decision.target_current - 7.4) < 0.2
 
 
+class TestEvChargingGuard:
+    """Tests for the _ev_is_charging guard that prevents SET_CURRENT
+    API calls when an EV is connected but not actually charging.
+
+    Two-layer detection:
+    1. ev_charging_entity (primary) — state.ev_charging is True/False
+    2. actual_power_entity (fallback) — current_power < threshold after grace
+    3. Unknown — returns True (backward compatible)
+    """
+
+    def _ev_on(self, drawn_power=4140.0, **kw):
+        """Build a dynamic-current EV appliance that is ON and drawing power."""
+        app = _make_appliance(
+            id="tesla",
+            name="Tesla",
+            priority=1,
+            nominal_power=7800.0,
+            phases=1,
+            dynamic_current=True,
+            current_entity="number.tesla_charge_current",
+            min_current=6.0,
+            max_current=32.0,
+            current_step=1.0,
+            is_big_consumer=True,
+            ev_connected_entity="binary_sensor.tesla_charge_cable",
+            **kw,
+        )
+        state = _make_state(
+            id="tesla",
+            is_on=True,
+            current_power=drawn_power,
+            ev_connected=True,
+        )
+        return app, state
+
+    def _run_opt(self, app, state, excess=2000.0):
+        power = _make_power(excess=excess, pv=6000.0)
+        history = [
+            PowerState(
+                pv_production=6000.0, grid_export=max(excess, 0.0),
+                grid_import=max(-excess, 0.0), load_power=6000.0 - excess,
+                excess_power=excess, battery_soc=None, battery_power=None,
+                ev_soc=None, timestamp=_utcnow() - timedelta(seconds=30 * i),
+            )
+            for i in range(30)
+        ]
+        opt = _optimizer_for_tests(grid_voltage=230, off_threshold=-100)
+        result = opt.optimize(
+            power_state=power,
+            appliances=[app],
+            appliance_states=[state],
+            plan=_empty_plan(),
+            power_history=history,
+            tariff=_make_tariff(),
+        )
+        return next(d for d in result.decisions if d.appliance_id == "tesla")
+
+    def test_set_current_skipped_when_ev_charging_false(self):
+        """ev_charging_entity reports False (not charging) → no SET_CURRENT."""
+        app, state = self._ev_on(
+            ev_charging_entity="sensor.tesla_charging",
+            actual_power_entity="sensor.wall_connector_power",
+        )
+        state.ev_charging = False
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.ON
+        assert decision.target_current is None
+        assert "not drawing power" in decision.reason
+
+    def test_set_current_allowed_when_ev_charging_true(self):
+        """ev_charging_entity reports True (charging) → SET_CURRENT proceeds."""
+        app, state = self._ev_on(
+            ev_charging_entity="sensor.tesla_charging",
+            actual_power_entity="sensor.wall_connector_power",
+        )
+        state.ev_charging = True
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current is not None
+
+    def test_set_current_skipped_when_power_zero_after_grace(self):
+        """No ev_charging_entity, actual_power_entity reads 0W after grace
+        → fallback detects not charging → no SET_CURRENT."""
+        app, state = self._ev_on(
+            actual_power_entity="sensor.wall_connector_power",
+            drawn_power=0.0,
+        )
+        state.last_state_change = datetime.now() - timedelta(seconds=120)
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.ON
+        assert decision.target_current is None
+        assert "not drawing power" in decision.reason
+
+    def test_set_current_allowed_during_grace_period(self):
+        """No ev_charging_entity, actual_power_entity reads 0W but within
+        90s grace → fallback allows SET_CURRENT (ramp-up window)."""
+        app, state = self._ev_on(
+            actual_power_entity="sensor.wall_connector_power",
+            drawn_power=0.0,
+        )
+        state.last_state_change = datetime.now() - timedelta(seconds=30)
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current is not None
+
+    def test_set_current_allowed_when_no_charging_signal(self):
+        """Neither ev_charging_entity nor actual_power_entity → backward
+        compatible, SET_CURRENT proceeds as before."""
+        app, state = self._ev_on(drawn_power=4140.0)
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current is not None
+
+    def test_completion_threshold_does_not_gate_fallback(self):
+        """A configured completion_power_threshold (e.g. 200W = 'session done')
+        must NOT be used as the 'not drawing' floor: a car tapering at 150W is
+        still charging and keeps its current. Only the 50W floor applies."""
+        app, state = self._ev_on(
+            actual_power_entity="sensor.wall_connector_power",
+            completion_power_threshold=200.0,
+            drawn_power=150.0,
+        )
+        state.last_state_change = datetime.now() - timedelta(seconds=120)
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current is not None
+
+    def test_set_current_skipped_when_power_below_threshold_after_grace(self):
+        """actual_power_entity reads 30W (< 50W default threshold) after
+        grace → not charging."""
+        app, state = self._ev_on(
+            actual_power_entity="sensor.wall_connector_power",
+            drawn_power=30.0,
+        )
+        state.last_state_change = datetime.now() - timedelta(seconds=120)
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.ON
+        assert decision.target_current is None
+
+    def test_set_current_allowed_when_power_above_threshold_after_grace(self):
+        """actual_power_entity reads 100W (> 50W threshold) after grace →
+        charging, SET_CURRENT proceeds."""
+        app, state = self._ev_on(
+            actual_power_entity="sensor.wall_connector_power",
+            drawn_power=100.0,
+        )
+        state.last_state_change = datetime.now() - timedelta(seconds=120)
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current is not None
+
+    def test_ev_charging_entity_overrides_power_fallback(self):
+        """When ev_charging_entity says False but power is high, the
+        charging entity wins (e.g. sensor says 'stopped' but power
+        sensor still reads residual value)."""
+        app, state = self._ev_on(
+            ev_charging_entity="sensor.tesla_charging",
+            actual_power_entity="sensor.wall_connector_power",
+            drawn_power=5000.0,
+        )
+        state.ev_charging = False
+        decision = self._run_opt(app, state)
+        assert decision.action == Action.ON
+        assert decision.target_current is None
+
+    def test_not_charging_guard_skips_non_ev_dynamic_appliance(self):
+        """The not-charging freeze must only apply to actual EV appliances.
+
+        A non-EV modulating load (no ev_connected_entity) with a real
+        power measurement drawing <50W while ON must keep its normal
+        SET_CURRENT allocation instead of being frozen by a guard that
+        only makes sense for a car that can be asleep.
+        """
+        heater, state = self._ev_on(
+            actual_power_entity="sensor.heater_power",
+            drawn_power=30.0,
+        )
+        # Not an EV: no connected/charging sensors configured at all.
+        heater.ev_connected_entity = None
+        state.ev_connected = None
+        state.last_state_change = datetime.now() - timedelta(seconds=120)
+        decision = self._run_opt(heater, state, excess=2000.0)
+        assert decision.action == Action.SET_CURRENT
+        assert decision.target_current is not None
+        assert "not actively charging" not in decision.reason
+
+    def test_not_charging_reason_neutral_for_ev(self):
+        """The hold reason for a parked EV should not name the vehicle
+        type — it reports a measurement, not an identity."""
+        app, state = self._ev_on(
+            ev_charging_entity="sensor.tesla_charging",
+            actual_power_entity="sensor.wall_connector_power",
+        )
+        state.ev_charging = False
+        decision = self._run_opt(app, state)
+        assert decision.reason == "Staying on - not drawing power"
+
+
 class TestKonaProdRegression2026_04_08:
     """Regression tests for the 9 daytime Kona full-OFF events observed on
     prod on 2026-04-08 under reason ``Shed: insufficient excess (priority 1)``.
@@ -4812,3 +5400,308 @@ class TestPhase4CheapTariffDischargeBlock:
         assert decisions[0].action == Action.OFF
         assert "Battery SoC protection" in decisions[0].reason
 
+
+# ---------------------------------------------------------------------------
+# Phase 4 SoC-protection re-enable hysteresis (Feature A)
+# ---------------------------------------------------------------------------
+
+class TestPhase4SocHysteresis:
+    """Phase 4 SoC protection with a re-enable hysteresis band. Once tripped,
+    protection is held until SoC recovers to min + hysteresis, breaking the
+    oscillation that whiplashes big consumers (e.g. EV chargers) on/off."""
+
+    @staticmethod
+    def _decision(appliance_id: str, action: Action, reason: str):
+        return ControlDecision(
+            appliance_id=appliance_id, action=action,
+            target_current=None, reason=reason, overrides_plan=False,
+        )
+
+    def test_legacy_default_no_hysteresis_sheds_below_min(self):
+        """Defaults (hysteresis=0, not active) preserve single-threshold."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev")
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [appliance],
+            battery_soc=74.0, min_battery_soc=75.0,
+        )
+        assert action.should_limit is True
+        assert action.soc_protection_active is True
+        assert decisions[0].action == Action.OFF
+
+    def test_at_or_above_min_not_active_no_shed(self):
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev")
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [appliance],
+            battery_soc=75.0, min_battery_soc=75.0,
+        )
+        assert action.should_limit is False
+        assert action.soc_protection_active is False
+        assert decisions[0].action == Action.ON
+
+    def test_active_holds_within_band(self):
+        """Was active, SoC recovered above min but below min+band → STILL shed.
+        This is the case that previously re-enabled and oscillated."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev")
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [appliance],
+            battery_soc=76.0, min_battery_soc=75.0,
+            min_battery_soc_hysteresis=5.0,
+            battery_protection_active=True,
+        )
+        assert action.should_limit is True
+        assert action.soc_protection_active is True
+        assert decisions[0].action == Action.OFF
+
+    def test_active_releases_above_band(self):
+        """Was active, SoC recovered to min+band → release (no shed)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev")
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [appliance],
+            battery_soc=80.0, min_battery_soc=75.0,
+            min_battery_soc_hysteresis=5.0,
+            battery_protection_active=True,
+        )
+        assert action.should_limit is False
+        assert action.soc_protection_active is False
+        assert decisions[0].action == Action.ON
+
+    def test_band_ignored_when_not_active(self):
+        """Not active: the band must NOT pre-emptively trip protection above
+        the bare minimum (76% with min 75% stays running)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev")
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [appliance],
+            battery_soc=76.0, min_battery_soc=75.0,
+            min_battery_soc_hysteresis=5.0,
+            battery_protection_active=False,
+        )
+        assert action.should_limit is False
+        assert action.soc_protection_active is False
+        assert decisions[0].action == Action.ON
+
+    def test_not_active_trips_at_bare_min_with_band(self):
+        """Not active but SoC below bare minimum → trip (uses min, not min+band)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev")
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [appliance],
+            battery_soc=74.0, min_battery_soc=75.0,
+            min_battery_soc_hysteresis=5.0,
+            battery_protection_active=False,
+        )
+        assert action.should_limit is True
+        assert action.soc_protection_active is True
+        assert decisions[0].action == Action.OFF
+
+    def test_non_soc_returns_report_inactive(self):
+        """Big-consumer rate-limit and grid-block returns must report
+        soc_protection_active=False so the coordinator clears its latch."""
+        optimizer = _optimizer_for_tests()
+        # Big-consumer rate limit path
+        bc = _make_appliance(
+            id="ev", is_big_consumer=True, battery_max_discharge_override=2000.0,
+        )
+        decisions = [self._decision("ev", Action.ON, "Excess available")]
+        action = optimizer._battery_discharge_protection(
+            decisions, [bc], battery_soc=90.0, min_battery_soc=75.0,
+        )
+        assert action.should_limit is True
+        assert action.max_discharge_watts == 2000.0
+        assert action.soc_protection_active is False
+
+        # Grid-import block path
+        action2 = optimizer._battery_discharge_protection(
+            [self._decision("ev", Action.OFF, "shed")], [bc],
+            force_charge=True,
+        )
+        assert action2.should_limit is True
+        assert action2.soc_protection_active is False
+
+    def test_hysteresis_breaks_oscillation_across_cycles(self):
+        """Full optimize() loop simulating the coordinator threading the
+        soc_protection_active latch back in. Without hysteresis the EV would
+        re-enable at 76% and flap; with a 5-point band it stays off until 80%."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(
+            id="ev", nominal_power=1000.0,
+            is_big_consumer=True, battery_max_discharge_override=2000.0,
+        )
+        state = _make_state(id="ev", is_on=True, current_power=1000.0)
+
+        def run(soc: float, active: bool):
+            power = PowerState(
+                pv_production=4000, grid_export=2000, grid_import=0,
+                load_power=2000, excess_power=2000,
+                battery_soc=soc, battery_power=None, ev_soc=None,
+                timestamp=_utcnow(),
+            )
+            return optimizer.optimize(
+                power_state=power, appliances=[appliance],
+                appliance_states=[state], plan=_empty_plan(),
+                power_history=[power], tariff=_make_tariff(),
+                min_battery_soc=75.0, min_battery_soc_hysteresis=5.0,
+                battery_protection_active=active,
+            )
+
+        # Cycle 1: battery drains to 74% → shed.
+        r1 = run(74.0, False)
+        assert r1.decisions[0].action == Action.OFF
+        assert r1.battery_discharge_action.soc_protection_active is True
+
+        # Cycle 2: EV off, battery recovers to 76% (above min, within band) →
+        # STILL shed. This is the oscillation that hysteresis fixes.
+        active = r1.battery_discharge_action.soc_protection_active
+        r2 = run(76.0, active)
+        assert r2.decisions[0].action == Action.OFF, (
+            "hysteresis must hold the EV off at 76% (within re-enable band)"
+        )
+        assert r2.battery_discharge_action.soc_protection_active is True
+
+        # Cycle 3: battery reaches 81% (above min+band) → release, EV allocated.
+        active = r2.battery_discharge_action.soc_protection_active
+        r3 = run(81.0, active)
+        assert r3.decisions[0].action in (Action.ON, Action.SET_CURRENT)
+        assert r3.battery_discharge_action.soc_protection_active is False
+
+    def test_without_hysteresis_oscillates_at_threshold(self):
+        """Contrast: with hysteresis=0 the EV re-enables at 76% (legacy flap)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(id="ev", nominal_power=1000.0)
+        state = _make_state(id="ev", is_on=True, current_power=1000.0)
+        power = PowerState(
+            pv_production=4000, grid_export=2000, grid_import=0,
+            load_power=2000, excess_power=2000,
+            battery_soc=76.0, battery_power=None, ev_soc=None,
+            timestamp=_utcnow(),
+        )
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+            min_battery_soc=75.0, min_battery_soc_hysteresis=0.0,
+            battery_protection_active=True,  # was shed last cycle
+        )
+        # No band → 76% >= 75% → re-enabled immediately (the bug behaviour).
+        assert result.decisions[0].action in (Action.ON, Action.SET_CURRENT)
+        assert result.battery_discharge_action.soc_protection_active is False
+
+
+# ---------------------------------------------------------------------------
+# TestMinBatterySocStart
+# ---------------------------------------------------------------------------
+
+class TestMinBatterySocStart:
+    """Per-appliance battery SoC start gate."""
+
+    def _power(self, battery_soc: float) -> PowerState:
+        return PowerState(
+            pv_production=4000, grid_export=2000, grid_import=0,
+            load_power=2000, excess_power=2000,
+            battery_soc=battery_soc, battery_power=None, ev_soc=None,
+            timestamp=_utcnow(),
+        )
+
+    def test_blocks_start_when_below_threshold(self):
+        """OFF appliance stays IDLE when battery SoC < threshold."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(nominal_power=1000.0, min_battery_soc_start=50.0)
+        state = _make_state(is_on=False)
+        power = self._power(battery_soc=30.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+        )
+
+        assert len(result.decisions) == 1
+        assert result.decisions[0].action == Action.IDLE
+        assert "30%" in result.decisions[0].reason
+        assert "50%" in result.decisions[0].reason
+
+    def test_allows_start_when_at_threshold(self):
+        """OFF appliance gets allocated when battery SoC >= threshold (strict <)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(nominal_power=1000.0, min_battery_soc_start=50.0)
+        state = _make_state(is_on=False)
+        power = self._power(battery_soc=50.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+        )
+
+        assert result.decisions[0].action in (Action.ON, Action.SET_CURRENT)
+
+    def test_does_not_stop_running_appliance(self):
+        """ON appliance keeps running even when battery SoC drops below threshold."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(nominal_power=1000.0, min_battery_soc_start=50.0)
+        state = _make_state(is_on=True, current_power=1000.0)
+        power = self._power(battery_soc=20.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+        )
+
+        assert result.decisions[0].action != Action.IDLE
+        assert result.decisions[0].action != Action.OFF
+
+    def test_disabled_when_none(self):
+        """No threshold set (None) → gate disabled, normal allocation."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(nominal_power=1000.0, min_battery_soc_start=None)
+        state = _make_state(is_on=False)
+        power = self._power(battery_soc=10.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+        )
+
+        assert result.decisions[0].action in (Action.ON, Action.SET_CURRENT)
+
+    def test_graceful_when_battery_soc_none(self):
+        """Battery sensor unavailable (None) → gate bypassed, allow start."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(nominal_power=1000.0, min_battery_soc_start=50.0)
+        state = _make_state(is_on=False)
+        power = self._power(battery_soc=None)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+        )
+
+        assert result.decisions[0].action in (Action.ON, Action.SET_CURRENT)
+
+    def test_boundary_exactly_at_threshold(self):
+        """SoC == threshold → allowed (strict < check)."""
+        optimizer = _optimizer_for_tests()
+        appliance = _make_appliance(nominal_power=1000.0, min_battery_soc_start=50.0)
+        state = _make_state(is_on=False)
+        power = self._power(battery_soc=50.0)
+
+        result = optimizer.optimize(
+            power_state=power, appliances=[appliance],
+            appliance_states=[state], plan=_empty_plan(),
+            power_history=[power], tariff=_make_tariff(),
+        )
+
+        assert result.decisions[0].action in (Action.ON, Action.SET_CURRENT)

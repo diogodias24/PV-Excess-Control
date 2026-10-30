@@ -17,6 +17,8 @@ import pytest
 from custom_components.pv_excess_control.const import (
     CONF_BATTERY_CHARGE_POWER,
     CONF_BATTERY_DISCHARGE_POWER,
+    CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
+    CONF_BATTERY_MAX_DISCHARGE_ENTITY,
     CONF_BATTERY_POWER,
     CONF_BATTERY_SOC,
     CONF_BATTERY_STRATEGY,
@@ -196,6 +198,7 @@ def _make_coordinator(
     coord.appliance_states = {}
     coord.control_decisions = []
     coord.battery_discharge_action = None
+    coord._battery_soc_protection_active = False
     coord._planner_interval = entry.data.get(
         CONF_PLANNER_INTERVAL, DEFAULT_PLANNER_INTERVAL
     )
@@ -222,10 +225,14 @@ def _make_coordinator(
     coord._last_discharge_limit = None
     coord._last_state_change = {}
     coord._last_applied_current = {}
+    coord._last_current_change_ts = {}
     coord._activations_today = {}
     coord._needed_by_others = set()
     coord._previous_is_on = {}
     coord._was_enabled = True
+
+    coord.appliance_switch_intervals = {}
+    coord.appliance_restart_intervals = {}
 
     # Inverter forced grid-charge state machine fields
     coord._inverter_ctl = None
@@ -1389,6 +1396,48 @@ class TestGetApplianceStates:
         assert result["sub_1"].appliance_id == "sub_1"
 
 
+    def test_ev_at_home_tristate_from_tracker(self):
+        """ev_home_entity parsing is tri-state: 'home' -> True, away -> False,
+        unavailable/unknown/missing -> None (never fails closed to 'away')."""
+        from custom_components.pv_excess_control.models import ApplianceConfig
+
+        def _config():
+            return ApplianceConfig(
+                id="sub_ev", name="Tesla", entity_id="switch.tesla_charge",
+                priority=1, phases=1, nominal_power=7000.0,
+                actual_power_entity=None, dynamic_current=True,
+                current_entity="number.tesla_charge_current", min_current=6.0,
+                max_current=32.0, ev_soc_entity=None, ev_connected_entity=None,
+                ev_home_entity="device_tracker.tesla_location",
+                ev_charging_entity=None, is_big_consumer=True,
+                battery_max_discharge_override=None, on_only=False,
+                min_daily_runtime=None, max_daily_runtime=None,
+                schedule_deadline=None, switch_interval=300,
+                allow_grid_supplement=False, max_grid_power=None,
+            )
+
+        states = {
+            "switch.tesla_charge": MockState("on"),
+            "device_tracker.tesla_location": MockState("home"),
+        }
+        result = _make_coordinator(states=states)._get_appliance_states([_config()])
+        assert result["sub_ev"].ev_at_home is True
+
+        states["device_tracker.tesla_location"] = MockState("not_home")
+        result = _make_coordinator(states=states)._get_appliance_states([_config()])
+        assert result["sub_ev"].ev_at_home is False
+
+        for raw in ("unavailable", "unknown", "none", ""):
+            states["device_tracker.tesla_location"] = MockState(raw)
+            result = _make_coordinator(states=states)._get_appliance_states([_config()])
+            assert result["sub_ev"].ev_at_home is None, raw
+
+        states["device_tracker.tesla_location"] = MockState("unavailable")
+        del states["switch.tesla_charge"]
+        states["switch.tesla_charge"] = MockState("off")
+        result = _make_coordinator(states=states)._get_appliance_states([_config()])
+        assert result["sub_ev"].ev_at_home is None
+
     def test_disabled_appliance_state_preserved(self):
         """Disabling an appliance should NOT reset its runtime/energy counters."""
         from custom_components.pv_excess_control.models import ApplianceConfig, ApplianceState
@@ -1957,6 +2006,196 @@ class TestNeededByOthersCooldownBypass:
         turn_on_calls = [c for c in coord.hass.services.calls if c[1] == "turn_on"]
         assert len(turn_on_calls) == 0
 
+    def test_restart_interval_gates_re_enable_on_appliance(self):
+        """An OFF appliance re-enable is gated by restart_interval, not switch_interval."""
+        from custom_components.pv_excess_control.models import (
+            BatteryDischargeAction, ControlDecision, Action, OptimizerResult,
+        )
+        states = {"switch.standalone": MockState("off")}
+        sub = MagicMock()
+        sub.data = {
+            "appliance_name": "Standalone",
+            "appliance_entity": "switch.standalone",
+            "appliance_priority": 500,
+            "nominal_power": 200.0,
+            "phases": 1,
+            "dynamic_current": False,
+            "switch_interval": 60,
+            "restart_interval": 600,
+            "on_only": False,
+            "allow_grid_supplement": False,
+            "is_big_consumer": False,
+        }
+        entry = _make_config_entry(subentries={"sub_1": sub})
+        coord = _make_coordinator(states=states, entry=entry)
+
+        coord._get_appliance_configs()
+        # Stopped 120s ago: switch_interval (60s) elapsed, restart_interval (600s) not
+        coord._last_state_change["sub_1"] = datetime.now() - timedelta(seconds=120)
+
+        decision = ControlDecision(
+            appliance_id="sub_1",
+            action=Action.ON,
+            target_current=None,
+            reason="Excess available",
+            overrides_plan=False,
+        )
+        result = OptimizerResult(
+            decisions=[decision],
+            battery_discharge_action=BatteryDischargeAction(
+                should_limit=False,
+                max_discharge_watts=None,
+            ),
+        )
+
+        asyncio.get_event_loop().run_until_complete(coord._apply_decisions(result))
+
+        turn_on_calls = [c for c in coord.hass.services.calls if c[1] == "turn_on"]
+        assert len(turn_on_calls) == 0
+
+    def test_restart_interval_allows_re_enable_after_elapsed(self):
+        """Once restart_interval has elapsed, the re-enable goes through."""
+        from custom_components.pv_excess_control.models import (
+            BatteryDischargeAction, ControlDecision, Action, OptimizerResult,
+        )
+        states = {"switch.standalone": MockState("off")}
+        sub = MagicMock()
+        sub.data = {
+            "appliance_name": "Standalone",
+            "appliance_entity": "switch.standalone",
+            "appliance_priority": 500,
+            "nominal_power": 200.0,
+            "phases": 1,
+            "dynamic_current": False,
+            "switch_interval": 60,
+            "restart_interval": 600,
+            "on_only": False,
+            "allow_grid_supplement": False,
+            "is_big_consumer": False,
+        }
+        entry = _make_config_entry(subentries={"sub_1": sub})
+        coord = _make_coordinator(states=states, entry=entry)
+
+        coord._get_appliance_configs()
+        # Stopped 700s ago: both intervals elapsed
+        coord._last_state_change["sub_1"] = datetime.now() - timedelta(seconds=700)
+
+        decision = ControlDecision(
+            appliance_id="sub_1",
+            action=Action.ON,
+            target_current=None,
+            reason="Excess available",
+            overrides_plan=False,
+        )
+        result = OptimizerResult(
+            decisions=[decision],
+            battery_discharge_action=BatteryDischargeAction(
+                should_limit=False,
+                max_discharge_watts=None,
+            ),
+        )
+
+        asyncio.get_event_loop().run_until_complete(coord._apply_decisions(result))
+
+        turn_on_calls = [c for c in coord.hass.services.calls if c[1] == "turn_on"]
+        assert len(turn_on_calls) == 1
+        assert turn_on_calls[0][2]["entity_id"] == "switch.standalone"
+
+    def test_restart_interval_does_not_gate_shed_off(self):
+        """A running appliance's shed-OFF is gated by switch_interval only,
+        never extended by a longer restart_interval."""
+        from custom_components.pv_excess_control.models import (
+            BatteryDischargeAction, ControlDecision, Action, OptimizerResult,
+        )
+        states = {"switch.standalone": MockState("on")}
+        sub = MagicMock()
+        sub.data = {
+            "appliance_name": "Standalone",
+            "appliance_entity": "switch.standalone",
+            "appliance_priority": 500,
+            "nominal_power": 200.0,
+            "phases": 1,
+            "dynamic_current": False,
+            "switch_interval": 60,
+            "restart_interval": 600,
+            "on_only": False,
+            "allow_grid_supplement": False,
+            "is_big_consumer": False,
+        }
+        entry = _make_config_entry(subentries={"sub_1": sub})
+        coord = _make_coordinator(states=states, entry=entry)
+
+        coord._get_appliance_configs()
+        # Running for 120s: switch_interval (60s) elapsed → shed allowed
+        coord._last_state_change["sub_1"] = datetime.now() - timedelta(seconds=120)
+
+        decision = ControlDecision(
+            appliance_id="sub_1",
+            action=Action.OFF,
+            target_current=None,
+            reason="Insufficient excess",
+            overrides_plan=False,
+        )
+        result = OptimizerResult(
+            decisions=[decision],
+            battery_discharge_action=BatteryDischargeAction(
+                should_limit=False,
+                max_discharge_watts=None,
+            ),
+        )
+
+        asyncio.get_event_loop().run_until_complete(coord._apply_decisions(result))
+
+        turn_off_calls = [c for c in coord.hass.services.calls if c[1] == "turn_off"]
+        assert len(turn_off_calls) == 1
+        assert turn_off_calls[0][2]["entity_id"] == "switch.standalone"
+
+    def test_restart_interval_unset_falls_back_to_switch(self):
+        """No restart_interval configured → re-enable gated by switch_interval."""
+        from custom_components.pv_excess_control.models import (
+            BatteryDischargeAction, ControlDecision, Action, OptimizerResult,
+        )
+        states = {"switch.standalone": MockState("off")}
+        sub = MagicMock()
+        sub.data = {
+            "appliance_name": "Standalone",
+            "appliance_entity": "switch.standalone",
+            "appliance_priority": 500,
+            "nominal_power": 200.0,
+            "phases": 1,
+            "dynamic_current": False,
+            "switch_interval": 300,
+            "on_only": False,
+            "allow_grid_supplement": False,
+            "is_big_consumer": False,
+        }
+        entry = _make_config_entry(subentries={"sub_1": sub})
+        coord = _make_coordinator(states=states, entry=entry)
+
+        coord._get_appliance_configs()
+        # Stopped 120s ago, switch_interval 300s → still blocked
+        coord._last_state_change["sub_1"] = datetime.now() - timedelta(seconds=120)
+
+        decision = ControlDecision(
+            appliance_id="sub_1",
+            action=Action.ON,
+            target_current=None,
+            reason="Excess available",
+            overrides_plan=False,
+        )
+        result = OptimizerResult(
+            decisions=[decision],
+            battery_discharge_action=BatteryDischargeAction(
+                should_limit=False,
+                max_discharge_watts=None,
+            ),
+        )
+
+        asyncio.get_event_loop().run_until_complete(coord._apply_decisions(result))
+
+        turn_on_calls = [c for c in coord.hass.services.calls if c[1] == "turn_on"]
+        assert len(turn_on_calls) == 0
+
     def test_chained_dependencies_both_in_needed_by_others(self):
         """In a dependency chain A→B→C (A requires B, B requires C), both
         B and C should be in _needed_by_others. A is not needed by anyone."""
@@ -2281,3 +2520,301 @@ class TestActivationCountingOnStateTransition:
 
         # Stale cleanup should have removed it
         assert "sub_1" not in coord._previous_is_on
+
+
+# ---------------------------------------------------------------------------
+# Tests: dynamic-current change throttle (issue #41)
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicCurrentThrottle:
+    """Throttle on SET_CURRENT writes for already-running dynamic-current appliances."""
+
+    def _setup(self, throttle_data, last_applied=10.0, last_ts_age_s=0.0):
+        """Build a coordinator with one ON dynamic-current EV charger.
+
+        ``throttle_data`` is merged into the subentry data; ``last_applied`` is
+        the previously written current; ``last_ts_age_s`` is how long ago that
+        write happened.
+        """
+        sub = MagicMock()
+        sub.data = {
+            "appliance_name": "EV Charger",
+            "appliance_entity": "switch.charger",
+            "appliance_priority": 500,
+            "nominal_power": 0.0,
+            "phases": 1,
+            "dynamic_current": True,
+            "current_entity": "number.charger_current",
+            "min_current": 6.0,
+            "max_current": 16.0,
+            "switch_interval": 300,
+            "on_only": False,
+            "allow_grid_supplement": False,
+            "is_big_consumer": False,
+            **throttle_data,
+        }
+        entry = _make_config_entry(subentries={"sub_ev": sub})
+        coord = _make_coordinator(
+            states={"switch.charger": MockState("on")}, entry=entry,
+        )
+        coord._get_appliance_configs()
+        if last_applied is not None:
+            coord._last_applied_current["sub_ev"] = last_applied
+            coord._last_current_change_ts["sub_ev"] = (
+                datetime.now() - timedelta(seconds=last_ts_age_s)
+            )
+        return coord
+
+    @staticmethod
+    def _apply(coord, target):
+        from custom_components.pv_excess_control.models import OptimizerResult
+        decision = ControlDecision(
+            appliance_id="sub_ev",
+            action=Action.SET_CURRENT,
+            target_current=target,
+            reason="Dynamic current",
+            overrides_plan=False,
+        )
+        result = OptimizerResult(
+            decisions=[decision],
+            battery_discharge_action=BatteryDischargeAction(
+                should_limit=False, max_discharge_watts=None,
+            ),
+        )
+        asyncio.get_event_loop().run_until_complete(coord._apply_decisions(result))
+        return [c for c in coord.hass.services.calls if c[1] == "set_value"]
+
+    @staticmethod
+    def _apply_bypass(coord, target):
+        """Apply a SET_CURRENT decision flagged bypasses_cooldown (e.g. override)."""
+        from custom_components.pv_excess_control.models import OptimizerResult
+        decision = ControlDecision(
+            appliance_id="sub_ev",
+            action=Action.SET_CURRENT,
+            target_current=target,
+            reason="Manual override active (dynamic current at max)",
+            overrides_plan=True,
+            bypasses_cooldown=True,
+        )
+        result = OptimizerResult(
+            decisions=[decision],
+            battery_discharge_action=BatteryDischargeAction(
+                should_limit=False, max_discharge_watts=None,
+            ),
+        )
+        asyncio.get_event_loop().run_until_complete(coord._apply_decisions(result))
+        return [c for c in coord.hass.services.calls if c[1] == "set_value"]
+
+    def test_increase_within_interval_is_skipped(self):
+        coord = self._setup({"dynamic_current_interval": 300}, last_ts_age_s=10)
+        assert self._apply(coord, 12.0) == []
+
+    def test_increase_after_interval_is_applied(self):
+        coord = self._setup({"dynamic_current_interval": 300}, last_ts_age_s=301)
+        calls = self._apply(coord, 12.0)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 12.0
+        # Write time recorded for the next throttle window
+        assert coord._last_applied_current["sub_ev"] == 12.0
+
+    def test_decrease_bypasses_interval_by_default(self):
+        coord = self._setup({"dynamic_current_interval": 300}, last_ts_age_s=10)
+        calls = self._apply(coord, 8.0)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 8.0
+
+    def test_decrease_throttled_when_bypass_disabled(self):
+        coord = self._setup(
+            {"dynamic_current_interval": 300, "dynamic_current_decrease_bypass": False},
+            last_ts_age_s=10,
+        )
+        assert self._apply(coord, 8.0) == []
+
+    def test_min_delta_buffer_skips_small_change(self):
+        coord = self._setup({"dynamic_current_min_delta": 1.0}, last_applied=10.0)
+        assert self._apply(coord, 10.3) == []
+
+    def test_min_delta_buffer_allows_large_change(self):
+        coord = self._setup({"dynamic_current_min_delta": 1.0}, last_applied=10.0)
+        calls = self._apply(coord, 11.5)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 11.5
+
+    def test_defaults_preserve_write_every_cycle(self):
+        # interval=0, min_delta=0 (defaults): a 0.1A change still writes.
+        coord = self._setup({}, last_applied=10.0, last_ts_age_s=1)
+        calls = self._apply(coord, 10.1)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 10.1
+
+    def test_override_bypasses_interval_throttle(self):
+        # A manual override (bypasses_cooldown=True) must apply immediately even
+        # when the dynamic-current interval has not elapsed — otherwise toggling
+        # the override switch wouldn't take effect for up to `interval` seconds.
+        coord = self._setup({"dynamic_current_interval": 300}, last_ts_age_s=10)
+        calls = self._apply_bypass(coord, 16.0)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 16.0
+
+    def test_override_bypasses_min_delta_throttle(self):
+        # Even a sub-min-delta change is written immediately under override.
+        coord = self._setup({"dynamic_current_min_delta": 5.0}, last_applied=10.0)
+        calls = self._apply_bypass(coord, 11.0)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 11.0
+
+    def test_non_override_still_throttled_for_contrast(self):
+        # Same conditions without the bypass flag stay throttled — guards against
+        # the bypass accidentally disabling the throttle for normal decisions.
+        coord = self._setup({"dynamic_current_interval": 300}, last_ts_age_s=10)
+        assert self._apply(coord, 16.0) == []
+
+
+class TestBatteryDischargeRestoreFallback:
+    """The discharge limit must be restorable even when the user never set a
+    ``battery_max_discharge_default`` — otherwise a protection event (e.g. SoC
+    dropping below the minimum) writes ``max_discharge=0`` and the battery is
+    permanently locked out of discharging. The restore now falls back to the
+    entity's ``max`` attribute.
+    """
+
+    DISCHARGE_ENTITY = "number.battery_max_discharge"
+
+    @staticmethod
+    def _setup(*, default=None, entity_max=50.0, last_limit=0.0, entity_present=True):
+        config = {
+            CONF_PV_POWER: "sensor.pv_power",
+            CONF_GRID_EXPORT: "sensor.grid_export",
+            CONF_LOAD_POWER: "sensor.load_power",
+            CONF_GRID_VOLTAGE: DEFAULT_GRID_VOLTAGE,
+            CONF_CONTROLLER_INTERVAL: DEFAULT_CONTROLLER_INTERVAL,
+            CONF_PLANNER_INTERVAL: DEFAULT_PLANNER_INTERVAL,
+            CONF_TARIFF_PROVIDER: TariffProviderEnum.NONE,
+            CONF_FORECAST_PROVIDER: ForecastProviderEnum.NONE,
+            CONF_BATTERY_MAX_DISCHARGE_ENTITY: TestBatteryDischargeRestoreFallback.DISCHARGE_ENTITY,
+        }
+        if default is not None:
+            config[CONF_BATTERY_MAX_DISCHARGE_DEFAULT] = default
+        states = {}
+        if entity_present:
+            attrs = {} if entity_max is None else {"max": entity_max}
+            states[TestBatteryDischargeRestoreFallback.DISCHARGE_ENTITY] = MockState(
+                str(last_limit), attrs,
+            )
+        coord = _make_coordinator(
+            entry=_make_config_entry(data=config), states=states,
+        )
+        # Simulate the limit being stuck at a protective low value.
+        coord._last_discharge_limit = last_limit
+        return coord
+
+    @staticmethod
+    def _restore(coord):
+        action = BatteryDischargeAction(should_limit=False, max_discharge_watts=None)
+        asyncio.get_event_loop().run_until_complete(
+            coord._apply_battery_discharge_limit(action)
+        )
+        return [c for c in coord.hass.services.calls if c[1] == "set_value"]
+
+    def test_restores_to_entity_max_when_no_default(self):
+        # No default configured, entity exposes max=50 → restore to 50.
+        coord = self._setup(default=None, entity_max=50.0, last_limit=0.0)
+        calls = self._restore(coord)
+        assert len(calls) == 1
+        assert calls[0][2]["entity_id"] == self.DISCHARGE_ENTITY
+        assert calls[0][2]["value"] == 50.0
+        assert coord._last_discharge_limit == 50.0
+
+    def test_configured_default_takes_precedence_over_entity_max(self):
+        coord = self._setup(default=30.0, entity_max=50.0, last_limit=0.0)
+        calls = self._restore(coord)
+        assert len(calls) == 1
+        assert calls[0][2]["value"] == 30.0
+
+    def test_no_call_when_no_default_and_no_max_attribute(self):
+        # Entity present but exposes no `max` → cannot restore, no write.
+        coord = self._setup(default=None, entity_max=None, last_limit=0.0)
+        assert self._restore(coord) == []
+        assert coord._last_discharge_limit == 0.0
+
+    def test_no_call_when_entity_missing(self):
+        coord = self._setup(default=None, entity_present=False, last_limit=0.0)
+        assert self._restore(coord) == []
+
+    def test_no_redundant_call_when_already_at_max(self):
+        # Already restored to 50; the fallback must not re-issue the write.
+        coord = self._setup(default=None, entity_max=50.0, last_limit=50.0)
+        assert self._restore(coord) == []
+
+    def test_helper_parses_non_numeric_max_as_none(self):
+        coord = self._setup(default=None, entity_max="unknown", last_limit=0.0)
+        assert coord._discharge_entity_max(self.DISCHARGE_ENTITY) is None
+
+
+class TestBatteryDischargeUnitConversion:
+    """The optimizer emits the discharge limit in watts, but the configured
+    entity may be a current limit (amps). The applied value must be converted
+    to the entity's native unit so the inverter doesn't clamp a watts number
+    (e.g. 10000) down to its amp max (50), silently disabling the protection.
+    """
+
+    DISCHARGE_ENTITY = "number.battery_max_discharge"
+
+    @staticmethod
+    def _coord(attrs, voltage=230.0):
+        config = {
+            CONF_PV_POWER: "sensor.pv_power",
+            CONF_GRID_EXPORT: "sensor.grid_export",
+            CONF_LOAD_POWER: "sensor.load_power",
+            CONF_GRID_VOLTAGE: voltage,
+            CONF_CONTROLLER_INTERVAL: DEFAULT_CONTROLLER_INTERVAL,
+            CONF_PLANNER_INTERVAL: DEFAULT_PLANNER_INTERVAL,
+            CONF_TARIFF_PROVIDER: TariffProviderEnum.NONE,
+            CONF_FORECAST_PROVIDER: ForecastProviderEnum.NONE,
+            CONF_BATTERY_MAX_DISCHARGE_ENTITY: TestBatteryDischargeUnitConversion.DISCHARGE_ENTITY,
+        }
+        states = {
+            TestBatteryDischargeUnitConversion.DISCHARGE_ENTITY: MockState("0", attrs),
+        }
+        return _make_coordinator(entry=_make_config_entry(data=config), states=states)
+
+    @staticmethod
+    def _apply(coord, watts):
+        coord._last_discharge_limit = None  # force the write through
+        action = BatteryDischargeAction(should_limit=True, max_discharge_watts=watts)
+        asyncio.get_event_loop().run_until_complete(
+            coord._apply_battery_discharge_limit(action)
+        )
+        calls = [c for c in coord.hass.services.calls if c[1] == "set_value"]
+        return calls[0][2]["value"] if calls else None
+
+    def test_amps_entity_converts_watts_to_amps(self):
+        # 10000W at 230V -> 43.5A (was clamped to 50A before the fix).
+        coord = self._coord({"unit_of_measurement": "A", "max": 50}, voltage=230.0)
+        assert self._apply(coord, 10000.0) == 43.5
+
+    def test_current_device_class_converts_even_without_unit(self):
+        coord = self._coord({"device_class": "current", "max": 50}, voltage=230.0)
+        assert self._apply(coord, 4600.0) == 20.0
+
+    def test_watts_entity_writes_watts_unchanged(self):
+        coord = self._coord({"unit_of_measurement": "W"})
+        assert self._apply(coord, 5000.0) == 5000.0
+
+    def test_kw_entity_converts_to_kilowatts(self):
+        coord = self._coord({"unit_of_measurement": "kW"})
+        assert self._apply(coord, 5000.0) == 5.0
+
+    def test_unknown_unit_assumes_watts(self):
+        coord = self._coord({})
+        assert self._apply(coord, 5000.0) == 5000.0
+
+    def test_zero_passes_through_for_amps_entity(self):
+        # A full block (0W) must stay 0 in any unit — no spurious conversion.
+        coord = self._coord({"unit_of_measurement": "A", "max": 50})
+        assert self._apply(coord, 0.0) == 0.0
+
+    def test_missing_entity_returns_watts(self):
+        coord = self._coord({"unit_of_measurement": "A"})
+        assert coord._discharge_watts_to_entity_unit("number.does_not_exist", 9000.0) == 9000.0

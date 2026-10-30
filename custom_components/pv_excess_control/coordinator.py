@@ -10,6 +10,7 @@ Central data hub that:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import time as _time
@@ -33,6 +34,8 @@ from .const import (
     CONF_BATTERY_MAX_DISCHARGE_DEFAULT,
     CONF_BATTERY_MAX_DISCHARGE_ENTITY,
     CONF_MIN_BATTERY_SOC,
+    CONF_MIN_BATTERY_SOC_HYSTERESIS,
+    DEFAULT_MIN_BATTERY_SOC_HYSTERESIS,
     CONF_BATTERY_CHARGE_PRICE_THRESHOLD,
     CONF_BATTERY_DISCHARGE_OVERRIDE,
     CONF_BATTERY_CHARGE_POWER,
@@ -47,10 +50,17 @@ from .const import (
     CONF_CURRENT_ENTITY,
     CONF_CURRENT_STEP,
     CONF_DYNAMIC_CURRENT,
+    CONF_DYNAMIC_CURRENT_INTERVAL,
+    CONF_DYNAMIC_CURRENT_MIN_DELTA,
+    CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
     CONF_ENABLE_PREEMPTION,
     CONF_EV_CONNECTED_ENTITY,
+    CONF_EV_CHARGING_ENTITY,
+    CONF_EV_FOLLOW_TARGET_SOC,
+    CONF_EV_HOME_ENTITY,
     CONF_EV_SOC_ENTITY,
     CONF_EV_TARGET_SOC,
+    CONF_EV_TARGET_SOC_ENTITY,
     CONF_EXPORT_LIMIT,
     CONF_FEED_IN_TARIFF,
     CONF_FEED_IN_TARIFF_SENSOR,
@@ -58,6 +68,7 @@ from .const import (
     CONF_FORECAST_SENSOR,
     CONF_FORECAST_TOMORROW_SENSOR,
     CONF_GRID_EXPORT,
+    CONF_GRID_IMPORT_CAP_W,
     CONF_GRID_VOLTAGE,
     CONF_IMPORT_EXPORT,
     CONF_IS_BIG_CONSUMER,
@@ -85,21 +96,30 @@ from .const import (
     CONF_PLANNER_INTERVAL,
     CONF_PROTECT_FROM_PREEMPTION,
     CONF_PRICE_SENSOR,
+    CONF_PV_DROP_THRESHOLD_W,
     CONF_PV_POWER,
     CONF_REQUIRES_APPLIANCE,
     CONF_HELPER_ONLY,
     CONF_SCHEDULE_DEADLINE,
     CONF_START_AFTER,
     CONF_END_BEFORE,
+    CONF_MIN_BATTERY_SOC_START,
     CONF_SWITCH_INTERVAL,
+    CONF_RESTART_INTERVAL,
     CONF_TARIFF_PROVIDER,
     CONF_ALLOW_GRID_SUPPLEMENT,
     DEFAULT_CONTROLLER_INTERVAL,
+    DEFAULT_GRID_IMPORT_CAP_W,
     DEFAULT_GRID_VOLTAGE,
     DEFAULT_OFF_THRESHOLD,
     DEFAULT_PLANNER_INTERVAL,
+    DEFAULT_PV_DROP_THRESHOLD_W,
     DEFAULT_STARTUP_GRACE_PERIOD,
     DEFAULT_SWITCH_INTERVAL,
+    SAFETY_BRAKE_PV_DROP_MIN_SAMPLES,
+    DEFAULT_DYNAMIC_CURRENT_INTERVAL,
+    DEFAULT_DYNAMIC_CURRENT_MIN_DELTA,
+    DEFAULT_DYNAMIC_CURRENT_DECREASE_BYPASS,
     DOMAIN,
     BatteryStrategy,
     PlanInfluence,
@@ -119,6 +139,7 @@ from .const import (
 )
 from .energy import create_tariff_provider
 from .forecast import create_forecast_provider
+from .helpers import parse_ev_charging
 from .models import (
     Action,
     ApplianceConfig,
@@ -143,6 +164,11 @@ _LOGGER = logging.getLogger(__name__)
 
 _OFF_STATES = {"off", "false", "False", "0"}
 _UNAVAILABLE_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, "none", ""}
+# EV home-presence gate: any of these (case-insensitive) means "not at home".
+# Unavailable/unknown states are NOT in this set — they yield "unknown"
+# (None) so the optimizer never treats a transient tracker outage as an
+# explicit "away" (which would yank the car off mid-session).
+_AWAY_STATES = {"not_home", "away", "off", "false", "no", "0", ""}
 
 # Maximum number of power history entries to keep (~30 min at 30s intervals)
 MAX_HISTORY_SIZE = 60
@@ -197,6 +223,23 @@ def _parse_sensor_bool(hass: HomeAssistant, entity_id: str | None) -> bool | Non
     if state is None or state.state in _UNAVAILABLE_STATES:
         return None
     return state.state in ("on", "true", "True", "1")
+
+
+def _resolve_ev_target_soc(hass: HomeAssistant, sub_data: dict) -> float | None:
+    """Resolve EV target SoC, optionally following a live entity.
+
+    When CONF_EV_FOLLOW_TARGET_SOC is enabled and the referenced entity has a
+    readable value, that live value is used (e.g. the car's own charge-limit
+    number). Otherwise the static configured CONF_EV_TARGET_SOC is the fallback,
+    including when the followed entity is unavailable.
+    """
+    if sub_data.get(CONF_EV_FOLLOW_TARGET_SOC) and sub_data.get(
+        CONF_EV_TARGET_SOC_ENTITY
+    ):
+        followed = _parse_sensor_float(hass, sub_data[CONF_EV_TARGET_SOC_ENTITY])
+        if followed is not None:
+            return followed
+    return sub_data.get(CONF_EV_TARGET_SOC)
 
 
 def _entity_state_dict(hass: HomeAssistant, entity_id: str) -> dict | None:
@@ -272,6 +315,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.appliance_states: dict[str, ApplianceState] = {}
         self.control_decisions: list[ControlDecision] = []
         self.battery_discharge_action: BatteryDischargeAction | None = None
+        # Carries SoC-protection state across cycles for the re-enable
+        # hysteresis band (CONF_MIN_BATTERY_SOC_HYSTERESIS).
+        self._battery_soc_protection_active: bool = False
 
         # Plan influence mode
         self._plan_influence = config_entry.data.get(
@@ -317,6 +363,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.appliance_priorities: dict[str, int] = {}
         self.appliance_min_daily_runtime: dict[str, int | None] = {}
         self.appliance_max_daily_runtime: dict[str, int | None] = {}
+        self.appliance_switch_intervals: dict[str, int] = {}
+        self.appliance_restart_intervals: dict[str, int | None] = {}
 
         # Initialize runtime priorities and runtime limits from saved subentry data
         subentries = getattr(config_entry, "subentries", {})
@@ -330,6 +378,10 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.appliance_min_daily_runtime[subentry_id] = d[CONF_MIN_DAILY_RUNTIME]
             if CONF_MAX_DAILY_RUNTIME in d:
                 self.appliance_max_daily_runtime[subentry_id] = d[CONF_MAX_DAILY_RUNTIME]
+            saved_interval = d.get(CONF_SWITCH_INTERVAL, DEFAULT_SWITCH_INTERVAL)
+            # Clamp to minimum of 5s to protect against legacy configs that may have stored 0
+            self.appliance_switch_intervals[subentry_id] = int(max(5, saved_interval))
+            self.appliance_restart_intervals[subentry_id] = d.get(CONF_RESTART_INTERVAL)
 
         # Track last-set battery discharge limit to avoid redundant calls.
         # Seed from actual entity value on startup to avoid unnecessary service calls.
@@ -345,6 +397,10 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Track last applied current per appliance for deduplication (H3)
         self._last_applied_current: dict[str, float] = {}
+
+        # Track when the dynamic current was last written per appliance, used
+        # to enforce the per-appliance dynamic-current change interval (issue #41).
+        self._last_current_change_ts: dict[str, datetime] = {}
 
         # Track daily activation count per appliance (OFF→ON transitions)
         self._activations_today: dict[str, int] = {}
@@ -570,6 +626,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 last_state_change=state.last_state_change,
                 ev_connected=state.ev_connected,
                 ev_soc=state.ev_soc,
+                ev_charging=state.ev_charging,
                 activations_today=0,
             )
         self.appliance_states = new_states  # Atomic replacement
@@ -726,6 +783,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         grid_voltage = self.config_entry.data.get(CONF_GRID_VOLTAGE, DEFAULT_GRID_VOLTAGE)
         self.optimizer.grid_voltage = grid_voltage
         min_battery_soc = self.config_entry.data.get(CONF_MIN_BATTERY_SOC)
+        min_battery_soc_hysteresis = self.config_entry.data.get(
+            CONF_MIN_BATTERY_SOC_HYSTERESIS, DEFAULT_MIN_BATTERY_SOC_HYSTERESIS
+        )
 
         # 8. Run optimizer
         try:
@@ -738,6 +798,8 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 tariff=tariff_info,
                 plan_influence=self._plan_influence,
                 min_battery_soc=min_battery_soc,
+                min_battery_soc_hysteresis=min_battery_soc_hysteresis,
+                battery_protection_active=self._battery_soc_protection_active,
                 force_charge=self.force_charge,
                 auto_grid_charge_engaged=self._grid_charge_engaged,
             )
@@ -747,6 +809,16 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.control_decisions = result.decisions
         self.battery_discharge_action = result.battery_discharge_action
+        # Persist SoC-protection state for next cycle's hysteresis decision.
+        self._battery_soc_protection_active = (
+            result.battery_discharge_action.soc_protection_active
+        )
+
+        # 8.5. Safety brake: Check for grid cap and PV drop conditions.
+        # Override optimizer decisions if emergency conditions detected.
+        # Applied BEFORE the decision debug log below so the logged reasons
+        # reflect the actual (post-brake) decisions that will be applied.
+        self._apply_safety_brake(result, power_state)
 
         on_count = sum(1 for d in result.decisions if d.action == Action.ON)
         off_count = sum(1 for d in result.decisions if d.action == Action.OFF)
@@ -1050,6 +1122,11 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             switch_interval = int(max(
                 5, sub_data.get(CONF_SWITCH_INTERVAL, DEFAULT_SWITCH_INTERVAL)
             ))
+            # Update runtime stored value
+            self.appliance_switch_intervals[subentry_id] = switch_interval
+            self.appliance_restart_intervals[subentry_id] = sub_data.get(
+                CONF_RESTART_INTERVAL
+            )
 
             config = ApplianceConfig(
                 id=subentry_id,
@@ -1065,7 +1142,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 max_current=sub_data.get(CONF_MAX_CURRENT, 16.0),
                 ev_soc_entity=sub_data.get(CONF_EV_SOC_ENTITY),
                 ev_connected_entity=sub_data.get(CONF_EV_CONNECTED_ENTITY),
-                ev_target_soc=sub_data.get(CONF_EV_TARGET_SOC),
+                ev_charging_entity=sub_data.get(CONF_EV_CHARGING_ENTITY),
+                ev_home_entity=sub_data.get(CONF_EV_HOME_ENTITY),
+                ev_target_soc=_resolve_ev_target_soc(self.hass, sub_data),
                 is_big_consumer=sub_data.get(CONF_IS_BIG_CONSUMER, False),
                 battery_max_discharge_override=sub_data.get(
                     CONF_BATTERY_DISCHARGE_OVERRIDE
@@ -1080,7 +1159,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 schedule_deadline=_parse_time_string(deadline_str),
                 start_after=_parse_time_string(sub_data.get(CONF_START_AFTER)),
                 end_before=_parse_time_string(sub_data.get(CONF_END_BEFORE)),
+                min_battery_soc_start=sub_data.get(CONF_MIN_BATTERY_SOC_START),
                 switch_interval=switch_interval,
+                restart_interval=sub_data.get(CONF_RESTART_INTERVAL),
                 allow_grid_supplement=sub_data.get(CONF_ALLOW_GRID_SUPPLEMENT, False),
                 max_grid_power=sub_data.get(CONF_MAX_GRID_POWER),
                 cheap_grid_target_current=sub_data.get(CONF_CHEAP_GRID_TARGET_CURRENT),
@@ -1094,6 +1175,20 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 max_daily_activations=max_activations,
                 on_threshold=sub_data.get(CONF_ON_THRESHOLD),
                 completion_power_threshold=sub_data.get(CONF_COMPLETION_POWER_THRESHOLD),
+                dynamic_current_interval=int(max(
+                    0, sub_data.get(
+                        CONF_DYNAMIC_CURRENT_INTERVAL, DEFAULT_DYNAMIC_CURRENT_INTERVAL
+                    )
+                )),
+                dynamic_current_min_delta=max(
+                    0.0, sub_data.get(
+                        CONF_DYNAMIC_CURRENT_MIN_DELTA, DEFAULT_DYNAMIC_CURRENT_MIN_DELTA
+                    )
+                ),
+                dynamic_current_decrease_bypass=sub_data.get(
+                    CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
+                    DEFAULT_DYNAMIC_CURRENT_DECREASE_BYPASS,
+                ),
             )
             configs.append(config)
 
@@ -1114,6 +1209,7 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for d in (
             self._last_state_change,
             self._last_applied_current,
+            self._last_current_change_ts,
             self._activations_today,
             self._previous_is_on,
             self.appliance_enabled,
@@ -1172,15 +1268,26 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.hass, config.ev_connected_entity
                 )
 
+            ev_charging: bool | None = None
+            if config.ev_charging_entity:
+                ev_charging = parse_ev_charging(
+                    self.hass, config.ev_charging_entity
+                )
+
             ev_soc: float | None = None
             if config.ev_soc_entity:
                 ev_soc = _parse_sensor_float(self.hass, config.ev_soc_entity)
+
+            ev_at_home: bool | None = None
+            if config.ev_home_entity:
+                home_state = self.hass.states.get(config.ev_home_entity)
+                if home_state is not None and home_state.state.lower() not in _UNAVAILABLE_STATES:
+                    ev_at_home = home_state.state.lower() not in _AWAY_STATES
 
             # Retrieve and update runtime from stored state
             previous = self.appliance_states.get(config.id)
             runtime_today = previous.runtime_today if previous else timedelta()
             energy_today = previous.energy_today if previous else 0.0
-            last_state_change = previous.last_state_change if previous else None
 
             # Increment runtime and energy if the appliance is currently ON
             if is_on and previous is not None:
@@ -1205,6 +1312,14 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if is_on and config.id not in self._last_state_change:
                 self._last_state_change[config.id] = datetime.now()
 
+            # Mirror the apply-phase cooldown timer. The state field must
+            # track self._last_state_change (authoritative, updated whenever
+            # a decision is applied) or the status sensor's "switch deferred"
+            # suffix and the EV grace-period logic would always see None.
+            last_state_change = self._last_state_change.get(
+                config.id, previous.last_state_change if previous else None
+            )
+
             state = ApplianceState(
                 appliance_id=config.id,
                 is_on=is_on,
@@ -1215,7 +1330,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 last_state_change=last_state_change,
                 ev_connected=ev_connected,
                 ev_soc=ev_soc,
+                ev_charging=ev_charging,
                 activations_today=self._activations_today.get(config.id, 0),
+                ev_at_home=ev_at_home,
             )
             states[config.id] = state
 
@@ -1255,7 +1372,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     last_state_change=old.last_state_change,
                     ev_connected=old.ev_connected,
                     ev_soc=old.ev_soc,
+                    ev_charging=old.ev_charging,
                     activations_today=old.activations_today,
+                    ev_at_home=old.ev_at_home,
                 )
 
         self.appliance_states = states
@@ -1389,6 +1508,135 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     # ------------------------------------------------------------------
+    # Safety brake: Grid cap and PV drop detection
+    # ------------------------------------------------------------------
+
+    def _apply_safety_brake(self, result: OptimizerResult, power_state: PowerState) -> None:
+        """Check for emergency conditions and override optimizer decisions.
+
+        Two triggers:
+        1. Grid import exceeds configured cap -> reduce EV currents to minimum.
+           Physical grid-limit protection: applied even to manually overridden
+           appliances (an override accepts grid draw, not grid overload).
+        2. PV production drops suddenly -> reduce EV currents to minimum.
+           Requires the drop to PERSIST across SAFETY_BRAKE_PV_DROP_MIN_SAMPLES
+           consecutive samples so a transient cloud dip doesn't trip it, and
+           skips manually overridden appliances (an override is an explicit
+           "charge anyway" command).
+
+        Trigger 2 additionally requires the grid-cap trigger to be enabled
+        (grid_import_cap_w > 0): it only ever fires when the drop already
+        causes real grid import, which only matters when a cap is being
+        enforced. Disabling the cap therefore disables PV-drop detection too
+        (they are not independently toggleable) — set grid_import_cap_w > 0
+        to enable the brake as a whole.
+
+        This acts as a safety brake to prevent grid overload when PV drops unexpectedly.
+        """
+        grid_import_cap_w = self.config_entry.data.get(
+            CONF_GRID_IMPORT_CAP_W, DEFAULT_GRID_IMPORT_CAP_W
+        )
+        pv_drop_threshold_w = self.config_entry.data.get(
+            CONF_PV_DROP_THRESHOLD_W, DEFAULT_PV_DROP_THRESHOLD_W
+        )
+
+        # Skip if both are disabled (set to 0)
+        if grid_import_cap_w <= 0 and pv_drop_threshold_w <= 0:
+            return
+
+        grid_import = power_state.grid_import or 0.0
+        pv_production = power_state.pv_production or 0.0
+
+        # Check grid import cap
+        grid_cap_exceeded = grid_import_cap_w > 0 and grid_import > grid_import_cap_w
+
+        # Check PV drop: compare current PV to what it was N samples ago
+        # (where N = SAFETY_BRAKE_PV_DROP_MIN_SAMPLES). Only fires if:
+        # 1. PV dropped by more than threshold
+        # 2. AND grid import is already positive (importing from grid)
+        #
+        # This prevents false positives when PV drops but there's still plenty
+        # of solar (e.g. 9.7kW → 7.1kW with 0W grid import — no emergency,
+        # just a cloud passing). If grid import is 0 or negative (exporting),
+        # there's no risk of grid overload regardless of PV drop. The optimizer
+        # will naturally adjust EV current on the next cycle; the safety brake
+        # is only for when the drop causes actual grid import.
+        pv_drop_detected = False
+        if pv_drop_threshold_w > 0 and grid_import_cap_w > 0:
+            lookback_idx = SAFETY_BRAKE_PV_DROP_MIN_SAMPLES
+            if len(self.power_history) > lookback_idx:
+                past_pv = self.power_history[-lookback_idx - 1].pv_production or 0.0
+                pv_drop = past_pv - pv_production
+                # Only fire if PV dropped significantly AND we're already importing
+                if pv_drop > pv_drop_threshold_w and grid_import > 0:
+                    pv_drop_detected = True
+                    _LOGGER.warning(
+                        "PV drop detected: %.0fW (%d samples ago) -> %.0fW (drop: %.0fW, "
+                        "threshold: %.0fW). Grid import: %.0fW (cap: %.0fW)",
+                        past_pv, lookback_idx, pv_production, pv_drop, pv_drop_threshold_w,
+                        grid_import, grid_import_cap_w,
+                    )
+
+        if not (grid_cap_exceeded or pv_drop_detected):
+            return
+
+        # Emergency condition detected - override EV currents to minimum.
+        # The PV-drop trigger respects manual overrides; the grid-cap trigger
+        # does not (physical grid-limit protection).
+        respect_override = pv_drop_detected and not grid_cap_exceeded
+        # Log both triggers when both fire, not just the first.
+        triggered = []
+        if grid_cap_exceeded:
+            triggered.append("grid cap exceeded")
+        if pv_drop_detected:
+            triggered.append("PV drop detected")
+        trigger_reason = " and ".join(triggered)
+        _LOGGER.warning(
+            "Safety brake activated: %s (grid_import=%.0fW, pv=%.0fW). "
+            "Reducing EV currents to minimum.",
+            trigger_reason, grid_import, pv_production,
+        )
+
+        # Override all SET_CURRENT decisions to minimum current, and remap
+        # turn-ON decisions to SET_CURRENT(min) so an emergency actually
+        # limits power instead of starting/keeping a full-draw charge.
+        for i, decision in enumerate(result.decisions):
+            if decision.action not in (Action.SET_CURRENT, Action.ON):
+                continue
+            config = self._get_appliance_config_by_id(decision.appliance_id)
+            if config and config.dynamic_current:
+                if respect_override and config.override_active:
+                    _LOGGER.debug(
+                        "Safety brake: skipping %s (manual override active)",
+                        decision.appliance_id[:12],
+                    )
+                    continue
+                min_current = config.min_current or 6.0
+                needs_reduction = (
+                    decision.action == Action.ON
+                    or decision.target_current is None
+                    or decision.target_current > min_current
+                )
+                if needs_reduction:
+                    _LOGGER.info(
+                        "Safety brake: reducing %s to %.1fA (minimum) [%s]",
+                        decision.appliance_id[:12],
+                        min_current,
+                        decision.action.value,
+                    )
+                    # Emergency reductions must reach the device this cycle:
+                    # force the bypass so neither the switch cooldown nor the
+                    # dynamic-current throttle can hold the reduction back.
+                    # dataclasses.replace keeps the other frozen fields intact.
+                    result.decisions[i] = dataclasses.replace(
+                        decision,
+                        action=Action.SET_CURRENT,
+                        target_current=min_current,
+                        reason=f"Safety brake: {trigger_reason} - reduced to minimum current",
+                        bypasses_cooldown=True,
+                    )
+
+    # ------------------------------------------------------------------
     # Apply decisions
     # ------------------------------------------------------------------
 
@@ -1473,12 +1721,20 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     last_change = self._last_state_change.get(decision.appliance_id)
                     if last_change is not None:
                         elapsed = (datetime.now() - last_change).total_seconds()
-                        if elapsed < appliance_config.switch_interval:
+                        # Direction-aware cooldown: a shed-OFF on a running
+                        # appliance is gated by switch_interval (hold-after-start);
+                        # a re-enable of an OFF appliance is gated by
+                        # restart_interval, which falls back to switch_interval
+                        # when unset so existing configs behave identically.
+                        interval = appliance_config.switch_interval
+                        if not is_on and appliance_config.restart_interval is not None:
+                            interval = appliance_config.restart_interval
+                        if elapsed < interval:
                             _LOGGER.debug(
                                 "Skipping %s for %s (%s): switch interval not elapsed "
                                 "(%.0fs of %ds)",
                                 decision.action, appliance_config.name, entity_id,
-                                elapsed, appliance_config.switch_interval,
+                                elapsed, interval,
                             )
                             continue  # Too soon to change
 
@@ -1504,22 +1760,54 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         _LOGGER.error("Failed to turn off %s: %s", appliance_config.name, err)
                         continue
                     self._last_applied_current.pop(decision.appliance_id, None)
+                    self._last_current_change_ts.pop(decision.appliance_id, None)
                 elif decision.action == Action.SET_CURRENT:
                     # For dynamic current, set the current entity if available
                     if (
                         appliance_config.current_entity
                         and decision.target_current is not None
                     ):
+                        last_applied = self._last_applied_current.get(decision.appliance_id)
                         # H3: Skip entirely if same current already applied and appliance is on
-                        if (
-                            is_on
-                            and decision.target_current == self._last_applied_current.get(decision.appliance_id)
-                        ):
+                        if is_on and decision.target_current == last_applied:
                             _LOGGER.debug(
                                 "Skipping SET_CURRENT for %s: current %.1fA already applied",
                                 appliance_config.name, decision.target_current,
                             )
                             continue
+
+                        # Dynamic-current change throttle (issue #41): rate-limit
+                        # current rewrites on an already-running appliance to avoid
+                        # exhausting EV-charger API command quotas. Reductions can be
+                        # configured to bypass the throttle so battery-less setups
+                        # don't import from the grid while clouds pass.
+                        # `bypasses_cooldown` decisions (manual override, deadline
+                        # must-run) are explicit "act now" commands and skip the
+                        # throttle entirely so they take effect immediately.
+                        if is_on and last_applied is not None and not decision.bypasses_cooldown:
+                            delta = abs(decision.target_current - last_applied)
+                            is_decrease = decision.target_current < last_applied
+                            bypass = is_decrease and appliance_config.dynamic_current_decrease_bypass
+                            if not bypass:
+                                min_delta = appliance_config.dynamic_current_min_delta
+                                if min_delta > 0 and delta < min_delta:
+                                    _LOGGER.debug(
+                                        "Skipping SET_CURRENT for %s: change %.2fA < min delta %.2fA",
+                                        appliance_config.name, delta, min_delta,
+                                    )
+                                    continue
+                                interval = appliance_config.dynamic_current_interval
+                                if interval > 0:
+                                    last_ts = self._last_current_change_ts.get(decision.appliance_id)
+                                    if last_ts is not None:
+                                        elapsed = (datetime.now() - last_ts).total_seconds()
+                                        if elapsed < interval:
+                                            _LOGGER.debug(
+                                                "Skipping SET_CURRENT for %s: interval not elapsed "
+                                                "(%.0fs of %ds)",
+                                                appliance_config.name, elapsed, interval,
+                                            )
+                                            continue
 
                         current_domain = (
                             appliance_config.current_entity.split(".")[0]
@@ -1542,8 +1830,10 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             _LOGGER.error("Failed to set current for %s: %s", appliance_config.name, err)
                             continue
 
-                        # Track last applied current for deduplication
+                        # Track last applied current for deduplication and the
+                        # write time for the dynamic-current change throttle.
                         self._last_applied_current[decision.appliance_id] = decision.target_current
+                        self._last_current_change_ts[decision.appliance_id] = datetime.now()
 
                         # H2: Only call turn_on if the appliance is not already on
                         if not is_on:
@@ -1601,15 +1891,40 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         domain = discharge_entity.split(".")[0] if "." in discharge_entity else "number"
 
         if action.should_limit and action.max_discharge_watts is not None:
-            # Big consumer active: limit discharge
-            target_value = action.max_discharge_watts
+            # Protection active: limit discharge. The optimizer always expresses
+            # the limit in watts, but inverters expose the entity either as power
+            # (W/kW) or as a battery current (A). Convert to the entity's native
+            # unit so we don't write a watts value into an amps field — which the
+            # inverter would silently clamp to its max (e.g. 10000 -> 50A,
+            # effectively "no limit", defeating the protection).
+            target_value = self._discharge_watts_to_entity_unit(
+                discharge_entity, action.max_discharge_watts,
+            )
         else:
-            # No big consumers active: restore to default
+            # No protection active: restore the discharge limit. Prefer the
+            # configured default; if the user never set one, fall back to the
+            # entity's own `max` attribute. Without this fallback a battery can
+            # get permanently stuck at a low limit (e.g. 0) after a protection
+            # event clears, because the restore would silently bail and leave
+            # the battery unable to discharge.
             default_value = data.get(CONF_BATTERY_MAX_DISCHARGE_DEFAULT)
             if default_value is None:
+                default_value = self._discharge_entity_max(discharge_entity)
+            else:
+                # The configured default is expressed in watts, like the
+                # optimizer's limit. Convert to the entity's native unit so
+                # an amps field isn't handed a watts number (the inverter
+                # would clamp e.g. 10000 -> its amp max, silently disabling
+                # the restore — the same bug the limit path already guards).
+                default_value = self._discharge_watts_to_entity_unit(
+                    discharge_entity, default_value,
+                )
+            if default_value is None:
                 _LOGGER.warning(
-                    "Battery discharge limit active but no default configured. "
-                    "Cannot restore. Configure battery_max_discharge_default in settings."
+                    "Battery discharge limit active but no default configured "
+                    "and entity %s exposes no 'max' attribute to restore from. "
+                    "Cannot restore — set battery_max_discharge_default in settings.",
+                    discharge_entity,
                 )
                 return
             target_value = default_value
@@ -1637,6 +1952,52 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except Exception as err:
             _LOGGER.error("Failed to set battery discharge limit: %s", err)
+
+    def _discharge_watts_to_entity_unit(
+        self, discharge_entity: str, watts: float
+    ) -> float:
+        """Translate a watts discharge limit into the target entity's native unit.
+
+        Battery discharge-limit entities vary by inverter: some take power
+        (``W``/``kW``), others a battery current (``A``, ``device_class:
+        current``). The optimizer works purely in watts; convert here so the
+        written value matches the field. Current limits are derived with the
+        configured grid voltage. Unknown units are assumed to be watts
+        (backward-compatible). ``0`` is unit-agnostic and passes through.
+        """
+        if watts == 0:
+            return 0.0
+        state = self.hass.states.get(discharge_entity)
+        if state is None:
+            return watts
+        unit = str(state.attributes.get("unit_of_measurement") or "").strip().lower()
+        device_class = str(state.attributes.get("device_class") or "").strip().lower()
+        if unit in ("a", "amp", "amps", "ampere", "amperes") or device_class == "current":
+            voltage = self.config_entry.data.get(CONF_GRID_VOLTAGE, DEFAULT_GRID_VOLTAGE)
+            if voltage and voltage > 0:
+                return round(watts / voltage, 1)
+            return watts
+        if unit in ("kw", "kilowatt", "kilowatts"):
+            return watts / 1000.0
+        return watts
+
+    def _discharge_entity_max(self, discharge_entity: str) -> float | None:
+        """Read the discharge-limit entity's ``max`` attribute as a restore fallback.
+
+        A ``number`` entity advertises its configured maximum via the ``max``
+        state attribute. When no ``battery_max_discharge_default`` is set, this
+        is the safest value to restore to so the battery is never left stuck at
+        a protective low limit. Returns None when the entity or attribute is
+        missing/non-numeric.
+        """
+        state = self.hass.states.get(discharge_entity)
+        if state is None:
+            return None
+        max_attr = state.attributes.get("max")
+        try:
+            return float(max_attr) if max_attr is not None else None
+        except (TypeError, ValueError):
+            return None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1680,7 +2041,9 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             max_current=sub_data.get(CONF_MAX_CURRENT, 16.0),
             ev_soc_entity=sub_data.get(CONF_EV_SOC_ENTITY),
             ev_connected_entity=sub_data.get(CONF_EV_CONNECTED_ENTITY),
-            ev_target_soc=sub_data.get(CONF_EV_TARGET_SOC),
+            ev_charging_entity=sub_data.get(CONF_EV_CHARGING_ENTITY),
+            ev_home_entity=sub_data.get(CONF_EV_HOME_ENTITY),
+            ev_target_soc=_resolve_ev_target_soc(self.hass, sub_data),
             is_big_consumer=sub_data.get(CONF_IS_BIG_CONSUMER, False),
             battery_max_discharge_override=sub_data.get(
                 CONF_BATTERY_DISCHARGE_OVERRIDE
@@ -1695,9 +2058,11 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             schedule_deadline=_parse_time_string(deadline_str),
             start_after=_parse_time_string(sub_data.get(CONF_START_AFTER)),
             end_before=_parse_time_string(sub_data.get(CONF_END_BEFORE)),
+            min_battery_soc_start=sub_data.get(CONF_MIN_BATTERY_SOC_START),
             switch_interval=int(max(
                 5, sub_data.get(CONF_SWITCH_INTERVAL, DEFAULT_SWITCH_INTERVAL)
             )),
+            restart_interval=sub_data.get(CONF_RESTART_INTERVAL),
             allow_grid_supplement=sub_data.get(CONF_ALLOW_GRID_SUPPLEMENT, False),
             max_grid_power=sub_data.get(CONF_MAX_GRID_POWER),
             cheap_grid_target_current=sub_data.get(CONF_CHEAP_GRID_TARGET_CURRENT),
@@ -1715,6 +2080,20 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ),
             on_threshold=sub_data.get(CONF_ON_THRESHOLD),
             completion_power_threshold=sub_data.get(CONF_COMPLETION_POWER_THRESHOLD),
+            dynamic_current_interval=int(max(
+                0, sub_data.get(
+                    CONF_DYNAMIC_CURRENT_INTERVAL, DEFAULT_DYNAMIC_CURRENT_INTERVAL
+                )
+            )),
+            dynamic_current_min_delta=max(
+                0.0, sub_data.get(
+                    CONF_DYNAMIC_CURRENT_MIN_DELTA, DEFAULT_DYNAMIC_CURRENT_MIN_DELTA
+                )
+            ),
+            dynamic_current_decrease_bypass=sub_data.get(
+                CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
+                DEFAULT_DYNAMIC_CURRENT_DECREASE_BYPASS,
+            ),
         )
 
     async def _turn_off_all_managed(self) -> None:
@@ -1782,6 +2161,12 @@ class PvExcessCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "battery_discharge_action": self.battery_discharge_action,
             "appliance_states": dict(self.appliance_states),
             "appliance_configs": {c.id: c for c in self._last_appliance_configs},
+            # Dynamic-current throttle context for the status sensor: the
+            # current actually written to each appliance, and when. Lets the
+            # status string show the *held* current instead of the optimizer's
+            # per-cycle computed target while a SET_CURRENT is throttled.
+            "applied_currents": dict(self._last_applied_current),
+            "current_change_ts": dict(self._last_current_change_ts),
             "grace_period_remaining": grace_period_remaining,
             "enabled": self._enabled,
             "tariff": self._last_tariff_info,

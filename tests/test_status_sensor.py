@@ -125,6 +125,9 @@ class TestStatusSensorNativeValue:
             "plan_action",
             "plan_window_start",
             "plan_window_end",
+            "not_drawing_power",
+            "current_deferred",
+            "current_deferred_seconds",
         }
         assert attrs["action"] == "on"
         assert attrs["overrides_plan"] is False
@@ -258,3 +261,109 @@ class TestStatusSensorNativeValue:
         text = sensor.native_value
         assert len(text) == 255
         assert text.endswith("...")
+
+
+class TestStatusSensorCurrentHoldEndToEnd:
+    """Coordinator throttle data surfaces as the status-sensor hold text.
+
+    Mirrors the live scenario from the "why was the current reduced"
+    investigation: the optimizer proposed a higher target but the
+    SET_CURRENT write was suppressed by the dynamic-current throttle
+    (coordinator.py), leaving `applied_currents` at the old value. The
+    status sensor must then report "Holding X.0A - target Y.0A deferred"
+    instead of echoing the optimizer's reason string.
+    """
+
+    def _make_ev_config(self) -> ApplianceConfig:
+        return ApplianceConfig(
+            id="sub123", name="Test EV", entity_id="switch.ev",
+            priority=100, phases=3, nominal_power=11000.0, actual_power_entity=None,
+            dynamic_current=True, current_entity="number.ev_current",
+            min_current=6.0, max_current=16.0,
+            ev_soc_entity=None, ev_connected_entity=None,
+            is_big_consumer=False, battery_max_discharge_override=None,
+            on_only=False,
+            min_daily_runtime=None, max_daily_runtime=None,
+            schedule_deadline=None,
+            switch_interval=300,
+            allow_grid_supplement=False, max_grid_power=None,
+            dynamic_current_interval=300,
+        )
+
+    def test_throttled_write_reports_hold_instead_of_optimizer_reason(self) -> None:
+        decision = ControlDecision(
+            appliance_id="sub123",
+            action=Action.SET_CURRENT,
+            target_current=12.0,
+            reason="Dynamic current adjustment: 12.0A (9660W available)",
+            overrides_plan=False,
+        )
+        state = ApplianceState(
+            appliance_id="sub123",
+            is_on=True,
+            current_power=9660.0,
+            current_amperage=14.0,
+            runtime_today=timedelta(0),
+            energy_today=0.0,
+            last_state_change=None,
+            ev_connected=None,
+        )
+        data = {
+            "control_decisions": [decision],
+            "appliance_states": {"sub123": state},
+            "appliance_configs": {"sub123": self._make_ev_config()},
+            "battery_discharge_action": BatteryDischargeAction(should_limit=False),
+            "current_plan": None,
+            "grace_period_remaining": None,
+            # Throttled write: applied stays at 10.0A while the optimizer
+            # proposed 12.0A ~30s ago (within the 300s dynamic interval).
+            "applied_currents": {"sub123": 10.0},
+            "current_change_ts": {"sub123": datetime.now() - timedelta(seconds=30)},
+        }
+        sensor = PvApplianceStatusSensor(
+            _make_coordinator_with_data(data), "sub123", "Test EV"
+        )
+        text = sensor.native_value
+        assert text is not None
+        assert text.startswith("Holding 10.0A - target 12.0A deferred")
+        assert "Dynamic current adjustment" not in text
+        attrs = sensor.extra_state_attributes
+        assert attrs["current_deferred"] is True
+        assert attrs["current_deferred_seconds"] is not None
+
+    def test_unthrottled_write_shows_optimizer_reason(self) -> None:
+        decision = ControlDecision(
+            appliance_id="sub123",
+            action=Action.SET_CURRENT,
+            target_current=12.0,
+            reason="Dynamic current adjustment: 12.0A (9660W available)",
+            overrides_plan=False,
+        )
+        state = ApplianceState(
+            appliance_id="sub123",
+            is_on=True,
+            current_power=9660.0,
+            current_amperage=12.0,
+            runtime_today=timedelta(0),
+            energy_today=0.0,
+            last_state_change=None,
+            ev_connected=None,
+        )
+        data = {
+            "control_decisions": [decision],
+            "appliance_states": {"sub123": state},
+            "appliance_configs": {"sub123": self._make_ev_config()},
+            "battery_discharge_action": BatteryDischargeAction(should_limit=False),
+            "current_plan": None,
+            "grace_period_remaining": None,
+            # Write went through: applied current matches the target.
+            "applied_currents": {"sub123": 12.0},
+            "current_change_ts": {"sub123": datetime.now() - timedelta(seconds=30)},
+        }
+        sensor = PvApplianceStatusSensor(
+            _make_coordinator_with_data(data), "sub123", "Test EV"
+        )
+        text = sensor.native_value
+        assert text == "Dynamic current adjustment: 12.0A (9660W available)"
+        attrs = sensor.extra_state_attributes
+        assert attrs["current_deferred"] is False

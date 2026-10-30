@@ -14,10 +14,13 @@ from .const import (
     CONF_APPLIANCE_NAME,
     CONF_MIN_DAILY_RUNTIME,
     CONF_MAX_DAILY_RUNTIME,
+    CONF_RESTART_INTERVAL,
+    CONF_SWITCH_INTERVAL,
     DOMAIN,
     MANUFACTURER,
     MAX_PRIORITY,
     MIN_PRIORITY,
+    DEFAULT_SWITCH_INTERVAL,
 )
 from .coordinator import PvExcessCoordinator
 
@@ -34,15 +37,155 @@ async def async_setup_entry(
 
     entities: list[NumberEntity] = []
 
-    # Per-appliance number entities: priority, min/max daily runtime
+    # Per-appliance number entities: priority, min/max daily runtime, switch interval
     subentries = getattr(config_entry, "subentries", {})
     for subentry_id, subentry in subentries.items():
         appliance_name = subentry.data.get(CONF_APPLIANCE_NAME, f"Appliance {subentry_id}")
         entities.append(AppliancePriorityNumber(coordinator, subentry_id, appliance_name))
         entities.append(ApplianceMinDailyRuntimeNumber(coordinator, subentry_id, appliance_name))
         entities.append(ApplianceMaxDailyRuntimeNumber(coordinator, subentry_id, appliance_name))
+        entities.append(ApplianceSwitchIntervalNumber(coordinator, subentry_id, appliance_name))
+        entities.append(ApplianceRestartIntervalNumber(coordinator, subentry_id, appliance_name))
 
     async_add_entities(entities)
+
+
+class ApplianceSwitchIntervalNumber(CoordinatorEntity[PvExcessCoordinator], NumberEntity):
+    """Per-appliance switch interval number entity."""
+
+    _attr_has_entity_name = True
+    _attr_native_min_value = 5.0
+    _attr_native_max_value = 3600.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = "s"
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:skip-next"
+
+    def __init__(
+        self,
+        coordinator: PvExcessCoordinator,
+        appliance_id: str,
+        appliance_name: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._appliance_id = appliance_id
+        self._appliance_name = appliance_name
+        self._attr_name = f"{appliance_name} Switch Interval"
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{appliance_id}_switch_interval"
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.config_entry.entry_id)},
+            name="PV Excess Control",
+            manufacturer=MANUFACTURER,
+        )
+
+    @property
+    def native_value(self) -> float:
+        return float(
+            self.coordinator.appliance_switch_intervals.get(self._appliance_id, DEFAULT_SWITCH_INTERVAL)
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Persist the switch interval to the coordinator and subentry.
+
+        Clamped to the 5s floor so a write below the protected minimum
+        (matching the coordinator's load-time clamp for legacy configs)
+        can never re-introduce a 0s interval.
+        """
+        new_value = int(max(5, int(value)))
+        self.coordinator.appliance_switch_intervals[self._appliance_id] = new_value
+        try:
+            subentries = getattr(self.coordinator.config_entry, "subentries", {})
+            subentry = subentries.get(self._appliance_id)
+            if subentry is not None:
+                new_data = dict(subentry.data)
+                new_data[CONF_SWITCH_INTERVAL] = new_value
+                await self.hass.config_entries.async_update_subentry(
+                    self.coordinator.config_entry, subentry, data=new_data
+                )
+        except Exception:
+            _LOGGER.debug(
+                "Could not persist switch_interval for %s (HA version may not support subentry updates)",
+                self._appliance_id,
+            )
+        self.async_write_ha_state()
+
+
+class ApplianceRestartIntervalNumber(CoordinatorEntity[PvExcessCoordinator], NumberEntity):
+    """Per-appliance restart interval number entity.
+
+    Minimum delay before an OFF appliance may be re-enabled. When unset
+    (None) the effective value shown is the appliance's switch_interval;
+    writing a value persists an explicit restart_interval override.
+    """
+
+    _attr_has_entity_name = True
+    _attr_native_min_value = 5.0
+    _attr_native_max_value = 3600.0
+    _attr_native_step = 1.0
+    _attr_native_unit_of_measurement = "s"
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:restart"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        coordinator: PvExcessCoordinator,
+        appliance_id: str,
+        appliance_name: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._appliance_id = appliance_id
+        self._appliance_name = appliance_name
+        self._attr_name = f"{appliance_name} Restart Interval"
+        self._attr_unique_id = (
+            f"{coordinator.config_entry.entry_id}_{appliance_id}_restart_interval"
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.config_entry.entry_id)},
+            name="PV Excess Control",
+            manufacturer=MANUFACTURER,
+        )
+
+    @property
+    def native_value(self) -> float:
+        raw = self.coordinator.appliance_restart_intervals.get(self._appliance_id)
+        if raw is None:
+            raw = self.coordinator.appliance_switch_intervals.get(
+                self._appliance_id, DEFAULT_SWITCH_INTERVAL
+            )
+        return float(raw)
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Persist the restart interval to the coordinator and subentry.
+
+        Clamped to the 5s floor, matching the switch-interval entity and the
+        coordinator's load-time clamp.
+        """
+        new_value = int(max(5, int(value)))
+        self.coordinator.appliance_restart_intervals[self._appliance_id] = new_value
+        try:
+            subentries = getattr(self.coordinator.config_entry, "subentries", {})
+            subentry = subentries.get(self._appliance_id)
+            if subentry is not None:
+                new_data = dict(subentry.data)
+                new_data[CONF_RESTART_INTERVAL] = new_value
+                await self.hass.config_entries.async_update_subentry(
+                    self.coordinator.config_entry, subentry, data=new_data
+                )
+        except Exception:
+            _LOGGER.debug(
+                "Could not persist restart_interval for %s (HA version may not support subentry updates)",
+                self._appliance_id,
+            )
+        self.async_write_ha_state()
 
 
 class AppliancePriorityNumber(CoordinatorEntity[PvExcessCoordinator], NumberEntity):
@@ -98,7 +241,10 @@ class AppliancePriorityNumber(CoordinatorEntity[PvExcessCoordinator], NumberEnti
         except Exception:
             # async_update_subentry may not exist in older HA versions;
             # runtime override still works until restart
-            _LOGGER.debug("Could not persist priority for %s (HA version may not support subentry updates)", self._appliance_id)
+            _LOGGER.debug(
+                "Could not persist priority for %s (HA version may not support subentry updates)",
+                self._appliance_id,
+            )
         self.async_write_ha_state()
 
 

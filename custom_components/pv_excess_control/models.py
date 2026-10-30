@@ -83,10 +83,14 @@ class ApplianceConfig:
     max_grid_power: float | None
 
     # Fields with defaults (must come after non-default fields)
+    # Optional home-presence gate: when set and the EV is not at home, PV won't control it.
+    ev_home_entity: str | None = None
+    ev_charging_entity: str | None = None  # Sensor reporting EV charging state (e.g. sensor.tesla_charging)
     cheap_price_threshold: float | None = None  # Per-appliance cheap threshold; None = use global
     ev_target_soc: float | None = None
     start_after: time | None = None
     end_before: time | None = None
+    min_battery_soc_start: float | None = None
     averaging_window: int | None = None  # Per-appliance history window in seconds (None = use global)
     requires_appliance: str | None = None  # Subentry ID of required dependency appliance
     helper_only: bool = False  # If True, this appliance runs only when at least one dependent (an appliance with requires_appliance pointing at it) is running. Has no effect on its own allocation.
@@ -95,6 +99,10 @@ class ApplianceConfig:
 
     # Preemption protection
     protect_from_preemption: bool = False
+
+    # Min seconds to wait before an OFF appliance may be re-enabled.
+    # None falls back to switch_interval (the original single-knob behaviour).
+    restart_interval: int | None = None
 
     # Dynamic current step size (default 0.1A)
     current_step: float = 0.1
@@ -114,6 +122,14 @@ class ApplianceConfig:
     # min_current. Capped by max_grid_power and max_current.
     cheap_grid_target_current: float | None = None
 
+    # Dynamic-current write throttling. Limits how often the charging current is
+    # rewritten to the device, to avoid exhausting EV-charger API command quotas
+    # (e.g. Tesla/TeslaFi). Only applies to SET_CURRENT on an already-running
+    # appliance. Defaults preserve the original write-every-cycle behaviour.
+    dynamic_current_interval: int = 0  # min seconds between current writes (0 = off)
+    dynamic_current_min_delta: float = 0.0  # min amp change before a write (0 = off)
+    dynamic_current_decrease_bypass: bool = True  # current reductions bypass the throttle
+
 
 @dataclass
 class ApplianceState:
@@ -127,7 +143,9 @@ class ApplianceState:
     last_state_change: datetime | None
     ev_connected: bool | None  # None if not EV
     ev_soc: float | None = None  # EV state of charge percentage
+    ev_charging: bool | None = None  # True/False if ev_charging_entity configured, None otherwise
     activations_today: int = 0
+    ev_at_home: bool | None = None  # None if no home gate configured
 
 
 @dataclass(frozen=True)
@@ -230,6 +248,11 @@ class BatteryDischargeAction:
     """Battery discharge limit decision."""
     should_limit: bool
     max_discharge_watts: float | None = None
+    # True when the SoC-based safety protection (shed appliances + block
+    # discharge because battery_soc is below the minimum) is currently
+    # active. The coordinator persists this across cycles to apply the
+    # re-enable hysteresis band (see CONF_MIN_BATTERY_SOC_HYSTERESIS).
+    soc_protection_active: bool = False
 
 
 @dataclass

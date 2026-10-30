@@ -22,7 +22,11 @@ from custom_components.pv_excess_control.const import (
     CONF_BATTERY_DISCHARGE_OVERRIDE,
     CONF_CURRENT_ENTITY,
     CONF_DYNAMIC_CURRENT,
+    CONF_DYNAMIC_CURRENT_INTERVAL,
+    CONF_DYNAMIC_CURRENT_MIN_DELTA,
+    CONF_DYNAMIC_CURRENT_DECREASE_BYPASS,
     CONF_EV_CONNECTED_ENTITY,
+    CONF_EV_CHARGING_ENTITY,
     CONF_EV_SOC_ENTITY,
     CONF_HELPER_ONLY,
     CONF_IS_BIG_CONSUMER,
@@ -196,6 +200,22 @@ class TestSchemaBuilders:
         assert CONF_MAX_CURRENT in keys
         assert CONF_EV_SOC_ENTITY in keys
         assert CONF_EV_CONNECTED_ENTITY in keys
+        assert CONF_EV_CHARGING_ENTITY in keys
+        # Dynamic-current throttle fields (issue #41)
+        assert CONF_DYNAMIC_CURRENT_INTERVAL in keys
+        assert CONF_DYNAMIC_CURRENT_MIN_DELTA in keys
+        assert CONF_DYNAMIC_CURRENT_DECREASE_BYPASS in keys
+
+    def test_current_schema_dynamic_throttle_defaults(self):
+        """Throttle fields default to the legacy write-every-cycle behaviour."""
+        schema = _appliance_current_schema()
+        defaults = {}
+        for marker in schema.schema:
+            if isinstance(marker, vol.Marker) and marker.default is not vol.UNDEFINED:
+                defaults[str(marker.schema)] = marker.default()
+        assert defaults[CONF_DYNAMIC_CURRENT_INTERVAL] == 0
+        assert defaults[CONF_DYNAMIC_CURRENT_MIN_DELTA] == 0.0
+        assert defaults[CONF_DYNAMIC_CURRENT_DECREASE_BYPASS] is True
 
     def test_constraints_schema_has_required_fields(self):
         """Constraints schema includes all constraint, grid, and big consumer fields."""
@@ -438,10 +458,12 @@ class TestStepCurrent:
         ev_input = dict(VALID_CURRENT_INPUT_ENABLED)
         ev_input[CONF_EV_SOC_ENTITY] = "sensor.ev_soc"
         ev_input[CONF_EV_CONNECTED_ENTITY] = "binary_sensor.ev_connected"
+        ev_input[CONF_EV_CHARGING_ENTITY] = "sensor.tesla_charging"
         await flow.async_step_current(user_input=ev_input)
 
         assert flow._data[CONF_EV_SOC_ENTITY] == "sensor.ev_soc"
         assert flow._data[CONF_EV_CONNECTED_ENTITY] == "binary_sensor.ev_connected"
+        assert flow._data[CONF_EV_CHARGING_ENTITY] == "sensor.tesla_charging"
 
 
 # ---------------------------------------------------------------------------

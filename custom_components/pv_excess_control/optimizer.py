@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import time
+from collections.abc import Callable
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from custom_components.pv_excess_control.const import (
     DEFAULT_DYNAMIC_ON_THRESHOLD,
     DEFAULT_GRID_VOLTAGE,
+    DEFAULT_NOT_DRAWING_THRESHOLD_W,
     DEFAULT_OFF_THRESHOLD,
     DEFAULT_ON_THRESHOLD,
+    NOT_DRAWING_GRACE_SECONDS,
+    SHED_COOLDOWN_BYPASS_IMPORT_W,
 )
 from custom_components.pv_excess_control.models import (
     Action,
@@ -56,12 +60,21 @@ class Optimizer:
         enable_preemption: bool = True,
         off_threshold: int = DEFAULT_OFF_THRESHOLD,
         min_good_samples: int = 3,
+        now_provider=None,
     ) -> None:
         self.grid_voltage = grid_voltage
         self._tz = ZoneInfo(timezone_str) if timezone_str else None
         self.enable_preemption = enable_preemption
         self._off_threshold = off_threshold
         self._min_good_samples = min_good_samples
+        # Injectable wall clock (defaults to datetime.now). Every time-based
+        # decision (deadline windows, plan windows, EV grace period) reads the
+        # time through this provider, so tests can pin it and the logic is
+        # fully deterministic. A provider must accept an optional `tz` arg,
+        # matching datetime.now's signature.
+        self._now: Callable[..., datetime] = (
+            now_provider if now_provider is not None else datetime.now
+        )
         # Initialised here for safety; optimize() overwrites both on every cycle.
         self._plan_influence: str = "none"
         self._grid_supplement_count: int = 0
@@ -76,6 +89,8 @@ class Optimizer:
         tariff: TariffInfo,
         plan_influence: str = "none",
         min_battery_soc: float | None = None,
+        min_battery_soc_hysteresis: float = 0.0,
+        battery_protection_active: bool = False,
         force_charge: bool = False,
         auto_grid_charge_engaged: bool = False,
     ) -> OptimizerResult:
@@ -135,6 +150,8 @@ class Optimizer:
                 sorted_appliances=sorted_appliances,
                 power_state=power_state,
                 min_battery_soc=min_battery_soc,
+                min_battery_soc_hysteresis=min_battery_soc_hysteresis,
+                battery_protection_active=battery_protection_active,
                 force_charge=force_charge,
                 auto_grid_charge_engaged=auto_grid_charge_engaged,
             )
@@ -196,6 +213,7 @@ class Optimizer:
                 appliance, state, app_avg_budget, instant_budget, plan, tariff,
                 decisions=decisions,
                 state_by_id=state_by_id,
+                battery_soc=power_state.battery_soc,
             )
             decisions.append(decision)
             _LOGGER.debug(
@@ -225,9 +243,12 @@ class Optimizer:
             )
 
         # Phase 3: SHED — reads the instantaneous budget (physical reality).
+        # avg_excess is passed so a shed-OFF can bypass the switch_interval cooldown
+        # when we are in SUSTAINED grid import (not just a transient instant dip).
         instant_budget = self._shed(
             decisions, sorted_appliances, state_by_id, instant_budget,
             force_shed=force_charge,
+            avg_excess=avg_excess,
         )
 
         # Phase 4: BATTERY DISCHARGE PROTECTION
@@ -235,9 +256,15 @@ class Optimizer:
             decisions, sorted_appliances,
             battery_soc=power_state.battery_soc,
             min_battery_soc=min_battery_soc,
+            min_battery_soc_hysteresis=min_battery_soc_hysteresis,
+            battery_protection_active=battery_protection_active,
             force_charge=force_charge,
             auto_grid_charge_engaged=auto_grid_charge_engaged,
         )
+
+        # Dependency consistency: no dependent may run while its required
+        # dependency is off or turning off this cycle (no-flow protection).
+        self._enforce_dependency_offs(decisions, state_by_id)
 
         return OptimizerResult(
             decisions=decisions,
@@ -268,9 +295,8 @@ class Optimizer:
 
     def _plan_says_on(self, appliance_id: str, plan: Plan) -> bool:
         """Check if the plan has an ON entry for this appliance in the current time window."""
-        from datetime import datetime
         # Use HA timezone if configured, otherwise fall back to system local timezone.
-        now = datetime.now(self._tz) if self._tz else datetime.now().astimezone()
+        now = self._now(self._tz) if self._tz else self._now().astimezone()
         for entry in plan.entries:
             if entry.appliance_id != appliance_id:
                 continue
@@ -332,18 +358,103 @@ class Optimizer:
                 return True
         return False
 
+    def _enforce_dependency_offs(
+        self,
+        decisions: list[ControlDecision],
+        state_by_id: dict[str, ApplianceState],
+    ) -> None:
+        """Force dependents OFF when their required dependency is not running.
+
+        Mirror of ``_has_running_dependent``: the helper protects a
+        dependency from being stopped while a dependent runs; this pass
+        protects a dependent from running without its dependency, which
+        would otherwise leave the dependent running dry (no flow) — e.g. a
+        heat pump that requires a circulation pump whose operating window
+        just ended. The dependency check in ``_apply_safety_rules`` only
+        guards against a *missing* dependency, not a dependency that is
+        decided OFF (window end, shed, battery protection) this cycle.
+
+        A dependent is forced OFF (bypassing cooldown) when its required
+        dependency is either decided OFF this cycle, or has no/IDLE decision
+        and is physically off. Runs as a fixpoint so dependency chains
+        (A needs B, B needs C) resolve within one call. Manually overridden
+        dependents are left alone — the user's explicit choice wins.
+        """
+        decision_by_id = {d.appliance_id: d for d in decisions}
+        changed = True
+        while changed:
+            changed = False
+            for appliance in self._config_by_id.values():
+                if not appliance.requires_appliance:
+                    continue
+                if appliance.override_active:
+                    continue
+                dec = decision_by_id.get(appliance.id)
+                if dec is None:
+                    # No decision this cycle. Only trust a *present* physical
+                    # state: a missing state entry (transient collection miss)
+                    # is not evidence the appliance stopped, and force-OFFing
+                    # a running dependent on it would be a false positive.
+                    state = state_by_id.get(appliance.id)
+                    running = state is not None and state.is_on
+                elif dec.action in (Action.ON, Action.SET_CURRENT):
+                    running = True
+                elif dec.action == Action.OFF:
+                    continue  # already stopping
+                else:  # Action.IDLE — no change this cycle, trust physical state
+                    state = state_by_id.get(appliance.id)
+                    running = state is not None and state.is_on
+                if not running:
+                    continue
+                dep_id = appliance.requires_appliance
+                dep_dec = decision_by_id.get(dep_id)
+                if dep_dec is not None and dep_dec.action in (Action.ON, Action.SET_CURRENT):
+                    continue  # dependency is on this cycle
+                if dep_dec is not None and dep_dec.action == Action.OFF:
+                    dep_off = True
+                else:  # dep_dec is None or IDLE — fall back to *present* physical state
+                    dep_state = state_by_id.get(dep_id)
+                    if dep_state is None:
+                        # Cannot confirm the dependency is off (transient state
+                        # miss) — leave the dependent alone this cycle.
+                        continue
+                    dep_off = not dep_state.is_on
+                if not dep_off:
+                    continue
+                dep_cfg = self._config_by_id.get(dep_id)
+                dep_name = dep_cfg.name if dep_cfg else dep_id
+                off_decision = ControlDecision(
+                    appliance_id=appliance.id,
+                    action=Action.OFF,
+                    target_current=None,
+                    reason=f"Dependency '{dep_name}' not running (no-flow protection)",
+                    overrides_plan=False,
+                    bypasses_cooldown=True,
+                )
+                if dec is None:
+                    decisions.append(off_decision)
+                else:
+                    for i, d in enumerate(decisions):
+                        if d.appliance_id == appliance.id:
+                            decisions[i] = off_decision
+                            break
+                decision_by_id[appliance.id] = off_decision
+                changed = True
+
     def _apply_safety_rules(
         self,
         appliance: ApplianceConfig,
         state: ApplianceState,
         decisions: list[ControlDecision],
         state_by_id: dict[str, ApplianceState],
+        battery_soc: float | None = None,
     ) -> tuple[ControlDecision, float] | None:
         """Apply excess-independent safety rules to a single appliance.
 
         Checks (in order): max_daily_runtime, max_daily_activations,
         manual override, helper_only short-circuit, EV connected,
-        EV SoC target, on_only, dependency availability, time window.
+        EV SoC target, on_only, dependency availability, time window,
+        battery SoC start gate.
 
         ``decisions`` and ``state_by_id`` are needed for the helper_only
         short-circuit to inspect dependent state. Other rules ignore them.
@@ -418,6 +529,10 @@ class Optimizer:
                         target_current=appliance.max_current,
                         reason="Manual override active (dynamic current at max)",
                         overrides_plan=True,
+                        # A manual override is an explicit "act now" command:
+                        # bypass the switch interval and the dynamic-current
+                        # throttle so the change is applied immediately.
+                        bypasses_cooldown=True,
                     ),
                     power_consumed,
                 )
@@ -429,6 +544,7 @@ class Optimizer:
                     target_current=None,
                     reason="Manual override active",
                     overrides_plan=True,
+                    bypasses_cooldown=True,
                 ),
                 power_consumed,
             )
@@ -482,6 +598,34 @@ class Optimizer:
                 ),
                 0.0,
             )
+
+        # EV home-presence gate: only manage the EV while it's at home. An away car
+        # (e.g. at a remote charger) must never be driven ON/SET_CURRENT, so it never
+        # becomes a shed candidate. Opt-in: only applies when ev_home_entity is set.
+        #
+        # Tri-state: True → manage normally. False (explicitly away) → shed. None
+        # (tracker unavailable/unknown) → never START a new charge, but do not
+        # interrupt an ongoing one either. Failing closed on a transient tracker
+        # outage would yank the car off mid-session on every HA restart.
+        if appliance.ev_home_entity and state.ev_at_home is not True:
+            if state.ev_at_home is False or not state.is_on:
+                reason = (
+                    "EV not at home"
+                    if state.ev_at_home is False
+                    else "EV location unknown"
+                )
+                action = Action.OFF if state.is_on else Action.IDLE
+                return (
+                    ControlDecision(
+                        appliance_id=appliance.id,
+                        action=action,
+                        target_current=None,
+                        reason=reason,
+                        overrides_plan=False,
+                        bypasses_cooldown=True,
+                    ),
+                    0.0,
+                )
 
         # EV SoC target check: stop charging when target reached
         # Placed before on_only so that EV SoC target is respected even for on_only appliances
@@ -537,8 +681,7 @@ class Optimizer:
 
         # Time window check: restrict appliance to specific operating hours
         if appliance.start_after is not None or appliance.end_before is not None:
-            from datetime import datetime
-            current_time = datetime.now(self._tz).time() if self._tz else datetime.now().time()
+            current_time = self._now(self._tz).time() if self._tz else self._now().time()
             if not self._is_within_time_window(current_time, appliance.start_after, appliance.end_before):
                 action = Action.OFF if state.is_on else Action.IDLE
                 # Build a descriptive reason
@@ -560,6 +703,31 @@ class Optimizer:
                     0.0,
                 )
 
+        # Battery SoC start gate: don't start this appliance until the home
+        # battery has at least this charge level. Only blocks OFF→ON — a
+        # running appliance is not stopped (that's min_battery_soc's job).
+        # No battery sensor configured → graceful no-op (allow start).
+        if (
+            appliance.min_battery_soc_start is not None
+            and battery_soc is not None
+            and not state.is_on
+            and battery_soc < appliance.min_battery_soc_start
+        ):
+            return (
+                ControlDecision(
+                    appliance_id=appliance.id,
+                    action=Action.IDLE,
+                    target_current=None,
+                    reason=(
+                        f"Waiting for battery SoC "
+                        f"{battery_soc:.0f}% >= {appliance.min_battery_soc_start:.0f}%"
+                    ),
+                    overrides_plan=False,
+                    bypasses_cooldown=True,
+                ),
+                0.0,
+            )
+
         return None
 
     def _optimize_safety_only(
@@ -569,6 +737,8 @@ class Optimizer:
         power_state: PowerState,
         min_battery_soc: float | None,
         *,
+        min_battery_soc_hysteresis: float = 0.0,
+        battery_protection_active: bool = False,
         force_charge: bool = False,
         auto_grid_charge_engaged: bool = False,
     ) -> OptimizerResult:
@@ -600,6 +770,7 @@ class Optimizer:
                 appliance, state,
                 decisions=decisions,
                 state_by_id=state_by_id,
+                battery_soc=power_state.battery_soc,
             )
             if safety_result is not None:
                 decision, _ = safety_result
@@ -620,6 +791,8 @@ class Optimizer:
             decisions, sorted_appliances,
             battery_soc=power_state.battery_soc,
             min_battery_soc=min_battery_soc,
+            min_battery_soc_hysteresis=min_battery_soc_hysteresis,
+            battery_protection_active=battery_protection_active,
             force_charge=force_charge,
             auto_grid_charge_engaged=auto_grid_charge_engaged,
         )
@@ -628,6 +801,11 @@ class Optimizer:
             "Optimizer safety-only path: %d decisions, battery_action=%s",
             len(decisions), battery_action,
         )
+
+        # Dependency consistency: no dependent may run while its required
+        # dependency is off or turning off this cycle (no-flow protection).
+        self._enforce_dependency_offs(decisions, state_by_id)
+
         return OptimizerResult(
             decisions=decisions,
             battery_discharge_action=battery_action,
@@ -643,6 +821,7 @@ class Optimizer:
         tariff: TariffInfo,
         decisions: list[ControlDecision] | None = None,
         state_by_id: dict[str, ApplianceState] | None = None,
+        battery_soc: float | None = None,
     ) -> tuple[ControlDecision, float]:
         """Determine the desired action for a single appliance.
 
@@ -671,6 +850,7 @@ class Optimizer:
             appliance, state,
             decisions=decisions if decisions is not None else [],
             state_by_id=state_by_id if state_by_id is not None else {},
+            battery_soc=battery_soc,
         )
         if safety_result is not None:
             return safety_result
@@ -687,6 +867,29 @@ class Optimizer:
         # turning off.
         if state.is_on:
             if appliance.dynamic_current and appliance.current_entity:
+                # Guard: skip SET_CURRENT adjustments when the EV is not
+                # actually charging (car at limit, asleep, or refused to
+                # start). Prevents burning EV API quotas on current
+                # rewrites that have no effect. The switch may be ON
+                # ("charge enabled") without the car drawing power.
+                # EV-scoped: only appliances with EV presence/charging
+                # inputs can meaningfully "not be charging"; a generic
+                # modulating load (heater etc.) with a low power reading
+                # must keep its normal allocation.
+                if (
+                    (appliance.ev_connected_entity or appliance.ev_charging_entity)
+                    and not self._ev_is_charging(appliance, state)
+                ):
+                    return (
+                        ControlDecision(
+                            appliance_id=appliance.id,
+                            action=Action.ON,
+                            target_current=None,
+                            reason="Staying on - not drawing power",
+                            overrides_plan=False,
+                        ),
+                        0.0,
+                    )
                 # Dual-budget bump clamp: use min(instant_budget, avg_budget)
                 # as the excess view for target computation. Asymmetric by
                 # design — reacts fast when instant_budget drops (physical
@@ -964,8 +1167,7 @@ class Optimizer:
             and appliance.min_daily_runtime is not None
             and state.runtime_today < appliance.min_daily_runtime
         ):
-            from datetime import datetime
-            current_time = datetime.now(self._tz).time() if self._tz else datetime.now().time()
+            current_time = self._now(self._tz).time() if self._tz else self._now().time()
             deadline = appliance.schedule_deadline
             remaining_runtime = (appliance.min_daily_runtime - state.runtime_today).total_seconds()
 
@@ -1087,8 +1289,7 @@ class Optimizer:
                 and appliance.min_daily_runtime is not None
                 and state.runtime_today < appliance.min_daily_runtime
             ):
-                from datetime import datetime
-                current_time = datetime.now(self._tz).time() if self._tz else datetime.now().time()
+                current_time = self._now(self._tz).time() if self._tz else self._now().time()
                 deadline = appliance.schedule_deadline
                 remaining_runtime = (appliance.min_daily_runtime - state.runtime_today).total_seconds()
                 now_seconds = current_time.hour * 3600 + current_time.minute * 60 + current_time.second
@@ -1176,6 +1377,52 @@ class Optimizer:
             ),
             power_consumed,
         )
+
+    # ------------------------------------------------------------------
+    # EV charging helpers
+    # ------------------------------------------------------------------
+
+    def _ev_is_charging(
+        self, appliance: ApplianceConfig, state: ApplianceState,
+    ) -> bool:
+        """Return True when the EV appears to be actively drawing power.
+
+        Two-layer detection:
+
+        1. **Primary** — ``ev_charging_entity`` (e.g.
+           ``sensor.tesla_charging``). When configured and available,
+           its state is authoritative: ``state.ev_charging`` is True
+           only when the car reports ``charging``.
+
+        2. **Fallback** — ``actual_power_entity``. When no charging
+           sensor is configured but a real power measurement exists,
+           treat the car as not charging when ``current_power`` stays
+           below ``DEFAULT_NOT_DRAWING_THRESHOLD_W`` (50W) after a
+           grace period. The grace period
+           (``NOT_DRAWING_GRACE_SECONDS``, 90s) covers the ramp-up
+           window after a charge starts.
+
+           The threshold is deliberately NOT ``completion_power_threshold``:
+           that value means "charge session complete" (a car tapering into
+           the top of the pack at 150W is still charging and must keep its
+           current), whereas the 50W floor only means "the car is asleep /
+           not connected" — drawing ~0W. Using the completion threshold here
+           would wrongly shed the current of a nearly-full car.
+
+        3. **Unknown** — when neither signal is available, returns
+           True (preserve the historical behaviour of adjusting every
+           cycle).
+        """
+        if state.ev_charging is not None:
+            return state.ev_charging
+        if appliance.actual_power_entity is not None:
+            if state.last_state_change is not None:
+                now = self._now()
+                elapsed = (now - state.last_state_change).total_seconds()
+                if elapsed < NOT_DRAWING_GRACE_SECONDS:
+                    return True
+            return state.current_power >= DEFAULT_NOT_DRAWING_THRESHOLD_W
+        return True
 
     # ------------------------------------------------------------------
     # Tariff helpers
@@ -1494,6 +1741,7 @@ class Optimizer:
         state_by_id: dict[str, ApplianceState],
         instant_budget: float,
         force_shed: bool = False,
+        avg_excess: float | None = None,
     ) -> float:
         """Phase 3: SHED - turn off or reduce lowest-priority appliances first.
 
@@ -1518,6 +1766,14 @@ class Optimizer:
         """
         if instant_budget >= self._off_threshold:
             return instant_budget
+
+        # Sustained grid import → shed-OFFs bypass the switch_interval cooldown so a
+        # grid-importing charge is stopped promptly. Keyed off the AVERAGED excess (not
+        # instant) so a transient cloud dip does not trigger it. Only the OFF bypasses;
+        # turning the appliance back ON still respects switch_interval, so no flapping.
+        sustained_import_bypass = (
+            avg_excess is not None and avg_excess < -SHED_COOLDOWN_BYPASS_IMPORT_W
+        )
 
         # Build lookup structures
         appliance_by_id: dict[str, ApplianceConfig] = {
@@ -1619,6 +1875,7 @@ class Optimizer:
                 target_current=None,
                 reason=f"Shed: insufficient excess (priority {appliance.priority})",
                 overrides_plan=False,
+                bypasses_cooldown=sustained_import_bypass,
             )
             instant_budget += freed_power
             _LOGGER.debug(
@@ -1690,6 +1947,8 @@ class Optimizer:
         battery_soc: float | None = None,
         min_battery_soc: float | None = None,
         *,
+        min_battery_soc_hysteresis: float = 0.0,
+        battery_protection_active: bool = False,
         force_charge: bool = False,
         auto_grid_charge_engaged: bool = False,
     ) -> BatteryDischargeAction:
@@ -1698,6 +1957,10 @@ class Optimizer:
         Three independent protections, evaluated in priority order:
         1. SoC-based (safety): When battery_soc < min_battery_soc, shed all
            shedable appliances and prevent all discharge (max_discharge_watts=0).
+           Hysteresis: once active (``battery_protection_active``), protection
+           is held until SoC climbs back to
+           ``min_battery_soc + min_battery_soc_hysteresis``, so big consumers
+           don't flap on/off at the exact threshold.
         2. Cheap-tariff / grid-import: When the integration is in any flavour
            of grid-import mode (any per-cycle decision tagged "grid supplement",
            OR manual force_charge switch ON, OR auto-grid-charge engaged), block
@@ -1715,15 +1978,31 @@ class Optimizer:
         }
 
         # --- SoC-based protection ---
+        # Effective shed threshold with re-enable hysteresis: when protection
+        # is already active we require SoC to recover to
+        # min_battery_soc + hysteresis before releasing; otherwise we shed at
+        # the bare minimum. This breaks the oscillation where an EV charger
+        # drains the battery just below the minimum, gets shed, the battery
+        # recovers to exactly the minimum, the charger is re-allowed, and the
+        # cycle repeats — leaving the car commanded on but never settling.
         if (
             battery_soc is not None
             and min_battery_soc is not None
-            and battery_soc < min_battery_soc
         ):
+            shed_threshold = min_battery_soc
+            if battery_protection_active and min_battery_soc_hysteresis > 0:
+                shed_threshold = min_battery_soc + min_battery_soc_hysteresis
+            soc_triggers_protection = battery_soc < shed_threshold
+        else:
+            soc_triggers_protection = False
+
+        if soc_triggers_protection:
             _LOGGER.info(
-                "Battery SoC %.1f%% is below minimum %.1f%% — shedding appliances "
+                "Battery SoC %.1f%% is below %s %.1f%% — shedding appliances "
                 "and blocking discharge",
-                battery_soc, min_battery_soc,
+                battery_soc,
+                "re-enable threshold" if battery_protection_active and min_battery_soc_hysteresis > 0 else "minimum",
+                shed_threshold,
             )
             # Shed all non-on_only, non-overridden appliances.
             # Shed big consumers first, then standard appliances.
@@ -1780,6 +2059,7 @@ class Optimizer:
             return BatteryDischargeAction(
                 should_limit=True,
                 max_discharge_watts=0,
+                soc_protection_active=True,
             )
 
         # --- Cheap-tariff / grid-import discharge block ---

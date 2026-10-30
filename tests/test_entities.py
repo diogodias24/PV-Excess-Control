@@ -9,12 +9,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from homeassistant.components.number import NumberMode
+
 from custom_components.pv_excess_control.const import (
     BatteryStrategy,
     DOMAIN,
     MANUFACTURER,
     MAX_PRIORITY,
     MIN_PRIORITY,
+    DEFAULT_SWITCH_INTERVAL,
 )
 from custom_components.pv_excess_control.models import ApplianceState, PowerState
 
@@ -32,6 +35,8 @@ def _make_coordinator(
     appliance_priorities: dict | None = None,
     appliance_min_daily_runtime: dict | None = None,
     appliance_max_daily_runtime: dict | None = None,
+    appliance_switch_intervals: dict | None = None,
+    appliance_restart_intervals: dict | None = None,
     coordinator_data: dict | None = None,
 ) -> MagicMock:
     """Return a mock PvExcessCoordinator."""
@@ -51,6 +56,12 @@ def _make_coordinator(
     )
     coord.appliance_max_daily_runtime = (
         appliance_max_daily_runtime if appliance_max_daily_runtime is not None else {}
+    )
+    coord.appliance_switch_intervals = (
+        appliance_switch_intervals if appliance_switch_intervals is not None else {}
+    )
+    coord.appliance_restart_intervals = (
+        appliance_restart_intervals if appliance_restart_intervals is not None else {}
     )
 
     # async_request_refresh returns a coroutine (kept for compatibility)
@@ -881,12 +892,14 @@ class TestNumberEntities:
         assert max_call_kwargs["data"]["max_daily_runtime"] == 60
 
     @pytest.mark.asyncio
-    async def test_async_setup_entry_adds_three_entities_per_subentry(self):
-        """async_setup_entry adds priority, min, and max entities for each subentry."""
+    async def test_async_setup_entry_adds_five_entities_per_subentry(self):
+        """async_setup_entry adds priority, min, max, switch, and restart interval entities per subentry."""
         from custom_components.pv_excess_control.number import (
             ApplianceMaxDailyRuntimeNumber,
             ApplianceMinDailyRuntimeNumber,
             AppliancePriorityNumber,
+            ApplianceRestartIntervalNumber,
+            ApplianceSwitchIntervalNumber,
             async_setup_entry,
         )
 
@@ -910,7 +923,9 @@ class TestNumberEntities:
         assert AppliancePriorityNumber in classes
         assert ApplianceMinDailyRuntimeNumber in classes
         assert ApplianceMaxDailyRuntimeNumber in classes
-        assert len(added) == 3
+        assert ApplianceSwitchIntervalNumber in classes
+        assert ApplianceRestartIntervalNumber in classes
+        assert len(added) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1075,3 +1090,272 @@ class TestSelectEntities:
         coord = _make_coordinator()
         sel = BatteryStrategySelect(coord)
         assert sel.name == "Battery Strategy"
+
+
+# ---------------------------------------------------------------------------
+# ApplianceSwitchIntervalNumber entity tests
+# ---------------------------------------------------------------------------
+
+class TestApplianceSwitchIntervalNumber:
+    """Tests for ApplianceSwitchIntervalNumber entity."""
+
+    def test_appliance_switch_interval_range(self):
+        """ApplianceSwitchIntervalNumber has range 5-3600 step 1, unit 's'."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator()
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.native_min_value == 5.0
+        assert num.native_max_value == 3600.0
+        assert num.native_step == 1.0
+        assert num.native_unit_of_measurement == "s"
+
+    def test_appliance_switch_interval_reads_coordinator(self):
+        """ApplianceSwitchIntervalNumber.native_value reads coordinator.appliance_switch_intervals."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator(appliance_switch_intervals={"app_1": 900})
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.native_value == 900.0
+
+    def test_appliance_switch_interval_default_when_not_set(self):
+        """ApplianceSwitchIntervalNumber.native_value defaults to 300 when not in dict."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator(appliance_switch_intervals={})
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.native_value == DEFAULT_SWITCH_INTERVAL
+
+    def test_appliance_switch_interval_unique_id(self):
+        """ApplianceSwitchIntervalNumber has expected unique_id."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator()
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.unique_id == "test_entry_id_app_1_switch_interval"
+
+    def test_appliance_switch_interval_name(self):
+        """ApplianceSwitchIntervalNumber name includes appliance name."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator()
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.name == "Pool Pump Switch Interval"
+
+    def test_appliance_switch_interval_is_read_only(self):
+        """ApplianceSwitchIntervalNumber has mode BOX."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator()
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num._attr_mode == NumberMode.BOX
+
+    def test_appliance_switch_interval_icon(self):
+        """ApplianceSwitchIntervalNumber uses the skip-next icon."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator()
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.icon == "mdi:skip-next"
+
+    @pytest.mark.asyncio
+    async def test_async_set_native_value_updates_coordinator_and_persists(self):
+        """Setting a value updates the coordinator dict and persists to the subentry."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator(appliance_switch_intervals={"app_1": 300})
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Pool Pump", "switch_interval": 300}
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        num.async_write_ha_state = MagicMock()
+        num.hass = MagicMock()
+        num.hass.config_entries.async_update_subentry = AsyncMock()
+
+        await num.async_set_native_value(900.0)
+
+        assert coord.appliance_switch_intervals["app_1"] == 900
+        num.hass.config_entries.async_update_subentry.assert_awaited_once()
+        _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
+        assert call_kwargs["data"]["switch_interval"] == 900
+
+    @pytest.mark.asyncio
+    async def test_async_set_native_value_clamps_below_min_to_5(self):
+        """Writing below the 5s floor clamps to 5 (matches coordinator load-time clamp)."""
+        from custom_components.pv_excess_control.number import ApplianceSwitchIntervalNumber
+
+        coord = _make_coordinator(appliance_switch_intervals={})
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Pool Pump"}
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceSwitchIntervalNumber(coord, "app_1", "Pool Pump")
+        num.async_write_ha_state = MagicMock()
+        num.hass = MagicMock()
+        num.hass.config_entries.async_update_subentry = AsyncMock()
+
+        await num.async_set_native_value(2.0)
+
+        assert coord.appliance_switch_intervals["app_1"] == 5
+        _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
+        assert call_kwargs["data"]["switch_interval"] == 5
+
+    @pytest.mark.asyncio
+    async def test_async_setup_entry_creates_switch_interval_per_appliance(self):
+        """async_setup_entry creates one ApplianceSwitchIntervalNumber per subentry,
+        not a single instance for the last subentry."""
+        from custom_components.pv_excess_control.number import (
+            ApplianceSwitchIntervalNumber,
+            async_setup_entry,
+        )
+
+        added: list = []
+        def _add(entities, update_before_add=False):
+            added.extend(entities)
+
+        hass = MagicMock()
+        coord = _make_coordinator()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry_id"
+        sub_a = MagicMock()
+        sub_a.data = {"appliance_name": "Pool Pump"}
+        sub_b = MagicMock()
+        sub_b.data = {"appliance_name": "Heat Pump"}
+        config_entry.subentries = {"app_1": sub_a, "app_2": sub_b}
+
+        hass.data = {"pv_excess_control": {config_entry.entry_id: coord}}
+
+        await async_setup_entry(hass, config_entry, _add)
+
+        intervals = [e for e in added if isinstance(e, ApplianceSwitchIntervalNumber)]
+        assert len(intervals) == 2
+        assert {e._appliance_id for e in intervals} == {"app_1", "app_2"}
+        assert len(added) == 10
+
+
+    @pytest.mark.asyncio
+    async def test_async_setup_entry_adds_five_entities_per_subentry(self):
+        """async_setup_entry adds priority, min, max, and switch_interval entities for each subentry."""
+        from custom_components.pv_excess_control.number import (
+            ApplianceSwitchIntervalNumber,
+            ApplianceRestartIntervalNumber,
+            ApplianceMaxDailyRuntimeNumber,
+            ApplianceMinDailyRuntimeNumber,
+            AppliancePriorityNumber,
+            async_setup_entry,
+        )
+
+        added: list = []
+        def _add(entities, update_before_add=False):
+            added.extend(entities)
+
+        hass = MagicMock()
+        coord = _make_coordinator()
+        config_entry = MagicMock()
+        config_entry.entry_id = "test_entry_id"
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Pool Pump"}
+        config_entry.subentries = {"app_1": subentry}
+
+        hass.data = {"pv_excess_control": {config_entry.entry_id: coord}}
+
+        await async_setup_entry(hass, config_entry, _add)
+
+        classes = {type(e) for e in added}
+        assert AppliancePriorityNumber in classes
+        assert ApplianceMinDailyRuntimeNumber in classes
+        assert ApplianceMaxDailyRuntimeNumber in classes
+        assert ApplianceSwitchIntervalNumber in classes
+        assert ApplianceRestartIntervalNumber in classes
+        assert len(added) == 5
+
+
+class TestApplianceRestartIntervalNumber:
+    """Tests for ApplianceRestartIntervalNumber entity."""
+
+    def test_appliance_restart_interval_reads_coordinator(self):
+        """native_value reads coordinator.appliance_restart_intervals."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+
+        coord = _make_coordinator(appliance_restart_intervals={"app_1": 900})
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.native_value == 900.0
+
+    def test_appliance_restart_interval_falls_back_to_switch(self):
+        """native_value falls back to switch_interval when restart not set."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+
+        coord = _make_coordinator(
+            appliance_restart_intervals={"app_1": None},
+            appliance_switch_intervals={"app_1": 600},
+        )
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.native_value == 600.0
+
+    def test_appliance_restart_interval_defaults_to_global(self):
+        """native_value defaults to DEFAULT_SWITCH_INTERVAL when neither set."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+
+        coord = _make_coordinator(appliance_restart_intervals={})
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.native_value == DEFAULT_SWITCH_INTERVAL
+
+    def test_appliance_restart_interval_unique_id_and_name(self):
+        """unique_id and name follow the per-appliance pattern."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+
+        coord = _make_coordinator()
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num.unique_id == "test_entry_id_app_1_restart_interval"
+        assert num.name == "Pool Pump Restart Interval"
+
+    def test_appliance_restart_interval_mode_icon_category(self):
+        """mode BOX, restart icon, CONFIG category."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+        from homeassistant.helpers.entity import EntityCategory
+
+        coord = _make_coordinator()
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        assert num._attr_mode == NumberMode.BOX
+        assert num.icon == "mdi:restart"
+        assert num._attr_entity_category == EntityCategory.CONFIG
+
+    @pytest.mark.asyncio
+    async def test_async_set_native_value_updates_coordinator_and_persists(self):
+        """Setting a value updates the coordinator dict and persists to the subentry."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+
+        coord = _make_coordinator(appliance_restart_intervals={"app_1": None})
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Pool Pump"}
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        num.async_write_ha_state = MagicMock()
+        num.hass = MagicMock()
+        num.hass.config_entries.async_update_subentry = AsyncMock()
+
+        await num.async_set_native_value(900.0)
+
+        assert coord.appliance_restart_intervals["app_1"] == 900
+        num.hass.config_entries.async_update_subentry.assert_awaited_once()
+        _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
+        assert call_kwargs["data"]["restart_interval"] == 900
+
+    @pytest.mark.asyncio
+    async def test_async_set_native_value_clamps_below_min_to_5(self):
+        """Writing below the 5s floor clamps to 5."""
+        from custom_components.pv_excess_control.number import ApplianceRestartIntervalNumber
+
+        coord = _make_coordinator(appliance_restart_intervals={})
+        subentry = MagicMock()
+        subentry.data = {"appliance_name": "Pool Pump"}
+        coord.config_entry.subentries = {"app_1": subentry}
+        num = ApplianceRestartIntervalNumber(coord, "app_1", "Pool Pump")
+        num.async_write_ha_state = MagicMock()
+        num.hass = MagicMock()
+        num.hass.config_entries.async_update_subentry = AsyncMock()
+
+        await num.async_set_native_value(2.0)
+
+        assert coord.appliance_restart_intervals["app_1"] == 5
+        _, call_kwargs = num.hass.config_entries.async_update_subentry.call_args
+        assert call_kwargs["data"]["restart_interval"] == 5
