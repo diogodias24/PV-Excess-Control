@@ -12,6 +12,21 @@
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa)](https://github.com/sponsors/InventoCasa)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-FFDD00)](https://buymeacoffee.com/henrikic)
 
+## Änderungen in diesem Fork
+
+> **Dies ist ein Fork von [InventoCasa/PV-Excess-Control](https://github.com/InventoCasa/PV-Excess-Control).** Die folgenden Änderungen bauen auf dem Upstream-Stand `b8cfc33` auf und sind nicht Teil der Upstream-Integration. Alles nach diesem Abschnitt ist die Upstream-Dokumentation.
+
+Was dieser Fork ergänzt:
+
+- **Battery Assist (solargeführt):** Ein Modus pro Gerät, in dem die Heimbatterie einen begrenzten Anteil der Leistung eines Geräts mit dynamischem Strom (z. B. einer Wallbox) übernimmt, während die Sonne den Rest liefert, bis hinunter zu einer Batterie-SoC-Untergrenze. Siehe [ADR 0001](docs/adr/0001-battery-assist-solar-led.md) (auf Englisch).
+- **Sicherheitsbremse:** Laufende Geräte werden sofort auf den Mindeststrom zurückgenommen, wenn der Netzbezug eine Grenze überschreitet oder die PV-Leistung stark einbricht.
+- **Drosselung des dynamischen Stroms:** Ein Mindestintervall und eine Mindeständerung in Ampere begrenzen, wie oft der Ladestrom neu geschrieben wird, um ratenbegrenzte Cloud-Ladegeräte zu schonen. Siehe [Dynamischer Strom](docs/features/dynamic-current.md).
+- **Neustart-Intervall:** Eine eigene Wartezeit für das Wiedereinschalten eines Geräts, damit Abschalt- und Wiedereinschaltsperre getrennt eingestellt werden können.
+- **Batterie-SoC-Hysterese:** Nachdem der Mindest-SoC-Schutz ausgelöst hat, muss sich die Batterie um einen einstellbaren Wert erholen, bevor Geräte wieder erlaubt werden.
+- **Start-Schwelle pro Gerät:** Ein optionaler Mindest-Batterie-SoC, den ein Gerät zum Starten braucht.
+- **E-Auto-Schutzfunktionen:** Ein „lädt nicht"-Schutz, eine Zuhause-Bedingung und die Option, den Ziel-SoC des Autos aus einer Entität zu übernehmen.
+- **Abhängigkeiten:** Ein fehlender Statuswert gilt nicht mehr als „Abhängigkeit aus".
+
 ## Über das Projekt
 
 PV Excess Control wird entwickelt und gepflegt von Henrik Wasserfuhr, Gründer von [**InventoCasa**](https://inventocasa.de). Wir sind spezialisierte Smart Home Integratoren und entwerfen sowie implementieren komplette Home Assistant Umgebungen für Neubauten, Renovierungen und Nachrüstungen.
@@ -119,19 +134,6 @@ Die Integration nutzt einen hybriden Ansatz aus Echtzeitsteuerung und Planung:
 - **Echtzeit-Controller** (alle 30 s) - Liest Live-Sensordaten, wendet Entscheidungen des Optimierers an
 - **Vorausschauender Planer** (alle 15 Min) - Erstellt optimale 24-Stunden-Zeitpläne anhand von Prognose- und Tarifdaten
 - **Pure-Logic Optimierer** - Keine HA-Abhängigkeiten, vollständig durch Unit-Tests abgedeckte Entscheidungs-Engine
-
-## Änderungen in diesem Fork
-
-Dieser Fork ergänzt den Upstream-Stand `b8cfc33` um Folgendes:
-
-- **Battery Assist (solargeführt):** Ein Modus pro Gerät, in dem die Heimbatterie einen begrenzten Anteil der Leistung eines Geräts mit dynamischem Strom (z. B. einer Wallbox) übernimmt, während die Sonne den Rest liefert, bis hinunter zu einer Batterie-SoC-Untergrenze. Siehe [ADR 0001](docs/adr/0001-battery-assist-solar-led.md) (auf Englisch).
-- **Sicherheitsbremse:** Laufende Geräte werden sofort auf den Mindeststrom zurückgenommen, wenn der Netzbezug eine Grenze überschreitet oder die PV-Leistung stark einbricht.
-- **Drosselung des dynamischen Stroms:** Ein Mindestintervall und eine Mindeständerung in Ampere begrenzen, wie oft der Ladestrom neu geschrieben wird, um ratenbegrenzte Cloud-Ladegeräte zu schonen. Siehe [Dynamischer Strom](docs/features/dynamic-current.md).
-- **Neustart-Intervall:** Eine eigene Wartezeit für das Wiedereinschalten eines Geräts, damit Abschalt- und Wiedereinschaltsperre getrennt eingestellt werden können.
-- **Batterie-SoC-Hysterese:** Nachdem der Mindest-SoC-Schutz ausgelöst hat, muss sich die Batterie um einen einstellbaren Wert erholen, bevor Geräte wieder erlaubt werden.
-- **Start-Schwelle pro Gerät:** Ein optionaler Mindest-Batterie-SoC, den ein Gerät zum Starten braucht.
-- **E-Auto-Schutzfunktionen:** Ein „lädt nicht"-Schutz, eine Zuhause-Bedingung und die Option, den Ziel-SoC des Autos aus einer Entität zu übernehmen.
-- **Abhängigkeiten:** Ein fehlender Statuswert gilt nicht mehr als „Abhängigkeit aus".
 
 ## Unterstütze dieses Projekt
 

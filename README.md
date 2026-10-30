@@ -12,6 +12,21 @@
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-%E2%98%95-FFDD00)](https://buymeacoffee.com/henrikic)
 
 
+## Fork changes
+
+> **This is a fork of [InventoCasa/PV-Excess-Control](https://github.com/InventoCasa/PV-Excess-Control).** The changes below sit on top of upstream release `b8cfc33` and are not part of the upstream integration. Everything after this section is the upstream documentation.
+
+What this fork adds:
+
+- **Battery Assist (solar-led):** a per-appliance mode where the home battery covers a capped share of a dynamic-current appliance's draw (for example an EV charger) while the sun covers the rest, down to a battery SoC floor. See [ADR 0001](docs/adr/0001-battery-assist-solar-led.md).
+- **Safety brake:** running appliances are cut back to minimum current at once when grid import exceeds a cap or PV output drops sharply.
+- **Dynamic-current throttle:** a minimum interval and a minimum amp change limit how often the charging current is rewritten, to protect rate-limited cloud chargers. See [Dynamic Current](docs/features/dynamic-current.md).
+- **Restart interval:** a separate cooldown for turning an appliance back on, so the shed cooldown and the restart wait can be tuned independently.
+- **Battery SoC hysteresis:** after the minimum-SoC protection trips, the battery must recover by a set margin before appliances are re-allowed.
+- **Start threshold per appliance:** an optional minimum battery SoC an appliance needs before it may start.
+- **EV guards:** a not-charging guard, a car-at-home gate and an option to follow the car's own target SoC from an entity.
+- **Dependencies:** a missing state reading no longer counts as "dependency off".
+
 ## About
 
 PV Excess Control is built and maintained by Henrik Wasserfuhr, founder of [**InventoCasa**](https://inventocasa.de). We are specialized smart home integrators, designing and deploying complete Home Assistant environments for new builds, renovations, and retrofits.
@@ -120,19 +135,6 @@ The integration uses a hybrid real-time + planning approach:
 - **Real-time Controller** (every 30 s) - Reads live sensor data, applies optimizer decisions
 - **Forward-Looking Planner** (every 15 min) - Creates optimal 24-hour schedules using forecast and tariff data
 - **Pure-Logic Optimizer** - Zero HA dependencies, fully unit-testable decision engine
-
-## Fork changes
-
-This fork adds the following on top of the upstream `b8cfc33` release:
-
-- **Battery Assist (solar-led):** a per-appliance mode where the home battery covers a capped share of a dynamic-current appliance's draw (for example an EV charger) while the sun covers the rest, down to a battery SoC floor. See [ADR 0001](docs/adr/0001-battery-assist-solar-led.md).
-- **Safety brake:** running appliances are cut back to minimum current at once when grid import exceeds a cap or PV output drops sharply.
-- **Dynamic-current throttle:** a minimum interval and a minimum amp change limit how often the charging current is rewritten, to protect rate-limited cloud chargers. See [Dynamic Current](docs/features/dynamic-current.md).
-- **Restart interval:** a separate cooldown for turning an appliance back on, so the shed cooldown and the restart wait can be tuned independently.
-- **Battery SoC hysteresis:** after the minimum-SoC protection trips, the battery must recover by a set margin before appliances are re-allowed.
-- **Start threshold per appliance:** an optional minimum battery SoC an appliance needs before it may start.
-- **EV guards:** a not-charging guard, a car-at-home gate and an option to follow the car's own target SoC from an entity.
-- **Dependencies:** a missing state reading no longer counts as "dependency off".
 
 ## Support this project
 
